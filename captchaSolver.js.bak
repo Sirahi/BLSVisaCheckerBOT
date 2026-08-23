@@ -1,7 +1,6 @@
 const Tesseract = require('tesseract.js')
 const sharp = require('sharp')
 const { By, until } = require('selenium-webdriver')
-const harvest = require('./harvest')
 
 let ocrStats = {
   totalAttempts: 0,
@@ -25,160 +24,192 @@ function resetOCRStats() {
 }
 
 // ============================================
-// HELPER: image processing pipeline
+// YARDIMCI: Görüntü işleme pipeline'ı
 // ============================================
+async function processImageForOCR(imgBuffer, config) {
+  try {
+    let pipeline = sharp(imgBuffer);
 
-// ============================================
-// ADAPTIVE PREPROCESSING (Pakistan/Intiana portal)
-// ------------------------------------------------
-// Fixed global thresholds erased pale digits: tiles whose glyphs differ from
-// the background in HUE but not BRIGHTNESS came out blank. These three steps
-// replaced 20 hand-tuned colour configs and took offline accuracy on 54 real
-// captured tiles from 74.1% to 94.4%. Benchmark: ../captcha-lab/bench4.js
-// ============================================
+    // 1. Kanal seçimi (RGB kanallarından birini al)
+    if (config.channel === 'blue') {
+      pipeline = sharp(await pipeline.extractChannel(2).toBuffer());
+    } else if (config.channel === 'green') {
+      pipeline = sharp(await pipeline.extractChannel(1).toBuffer());
+    } else if (config.channel === 'red') {
+      pipeline = sharp(await pipeline.extractChannel(0).toBuffer());
+    } else {
+      // Grayscale yap
+      pipeline = pipeline.grayscale();
+    }
 
-// Threshold derived from THIS tile's histogram instead of a hardcoded number.
-function otsuThreshold(gray) {
-  const hist = new Array(256).fill(0);
-  for (const v of gray) hist[v]++;
-  const total = gray.length;
-  let sum = 0; for (let i = 0; i < 256; i++) sum += i * hist[i];
-  let sumB = 0, wB = 0, best = 0, thr = 128;
-  for (let t = 0; t < 256; t++) {
-    wB += hist[t]; if (!wB) continue;
-    const wF = total - wB; if (!wF) break;
-    sumB += t * hist[t];
-    const mB = sumB / wB, mF = (sum - sumB) / wF;
-    const between = wB * wF * (mB - mF) * (mB - mF);
-    if (between > best) { best = between; thr = t; }
-  }
-  return thr;
-}
+    // 2. Boyutlandırma (hız için optimize - 2x yeterli)
+    const resizeFactor = config.resize || 2;
+    pipeline = pipeline.resize({
+      width: 120 * resizeFactor,
+      height: 60 * resizeFactor,
+      kernel: sharp.kernel.nearest, // En hızlı kernel
+      fit: 'fill'
+    });
 
-// Background = modal colour. Digits differ from it in hue, so distance from
-// the background separates them regardless of which colour they are.
-function colourDistanceMap(data, w, h) {
-  const bucket = {};
-  const q = v => (v >> 4) << 4;
-  for (let i = 0; i < data.length; i += 3) {
-    const k = `${q(data[i])},${q(data[i + 1])},${q(data[i + 2])}`;
-    bucket[k] = (bucket[k] || 0) + 1;
-  }
-  const [br, bg, bb] = Object.entries(bucket).sort((a, b) => b[1] - a[1])[0][0].split(',').map(Number);
-  const dist = new Float32Array(w * h); let max = 1;
-  for (let p = 0, i = 0; i < data.length; i += 3, p++) {
-    const d = Math.hypot(data[i] - br, data[i + 1] - bg, data[i + 2] - bb);
-    dist[p] = d; if (d > max) max = d;
-  }
-  const out = Buffer.alloc(w * h);
-  for (let p = 0; p < dist.length; p++) out[p] = Math.round((dist[p] / max) * 255);
-  return out;
-}
+    // 3. Kontrast ve parlaklık ayarı
+    if (config.brightness || config.contrast) {
+      // linear(a, b) -> output = input * a + b
+      const contrast = config.contrast || 1.0;
+      const brightness = config.brightness || 1.0;
+      pipeline = pipeline.linear(contrast, (brightness - 1) * 128);
+    }
 
-// Keep large blobs (digit strokes), drop small ones (crosshatch speckle).
-// This is the step that stopped Tesseract returning empty on noisy tiles.
-function filterComponents(bin, w, h, minPx) {
-  const lbl = new Int32Array(w * h).fill(-1);
-  const sizes = []; const stack = [];
-  for (let i = 0; i < w * h; i++) {
-    if (bin[i] === 0 || lbl[i] !== -1) continue;
-    const id = sizes.length; let n = 0;
-    stack.push(i); lbl[i] = id;
-    while (stack.length) {
-      const pq = stack.pop(); n++;
-      const x = pq % w, y = (pq / w) | 0;
-      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-        const nx = x + dx, ny = y + dy;
-        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
-        const qq = ny * w + nx;
-        if (bin[qq] === 0 && lbl[qq] === -1) { lbl[qq] = id; stack.push(qq); }
+    // 4. Gamma düzeltmesi
+    if (config.gamma) {
+      pipeline = pipeline.gamma(config.gamma);
+    }
+
+    // 5. Normalize (histogram equalization)
+    if (config.normalize) {
+      pipeline = pipeline.normalize();
+    }
+
+    // 6. Median blur (çizgileri silmek için çok etkili!)
+    if (config.median) {
+      pipeline = pipeline.median(config.median);
+    }
+
+    // 7. Blur (gürültü azaltma)
+    if (config.blur) {
+      pipeline = pipeline.blur(config.blur);
+    }
+
+    // 8. Sharpen (keskinleştirme)
+    if (config.sharpen) {
+      if (typeof config.sharpen === 'object') {
+        pipeline = pipeline.sharpen(config.sharpen.sigma, config.sharpen.flat, config.sharpen.jagged);
+      } else {
+        pipeline = pipeline.sharpen();
       }
     }
-    sizes.push(n);
+
+    // 9. Threshold (binary görüntü oluştur)
+    if (config.threshold) {
+      pipeline = pipeline.threshold(config.threshold);
+    }
+
+    // 10. Invert (renkleri tersine çevir)
+    if (config.invert) {
+      pipeline = pipeline.negate();
+    }
+
+    // 11. Morphological işlemler (dilate/erode simülasyonu)
+    if (config.morphKernel) {
+      pipeline = pipeline.convolve({
+        width: 3,
+        height: 3,
+        kernel: config.morphKernel
+      });
+    }
+
+    return await pipeline.png().toBuffer();
+  } catch (err) {
+    // Sessizce devam et, farklı yöntemler deneyecek
+    return imgBuffer;
   }
-  const out = Buffer.alloc(w * h, 255);
-  for (let i = 0; i < w * h; i++) {
-    const id = lbl[i];
-    if (id >= 0 && sizes[id] >= minPx) out[i] = 0;
-  }
-  return out;
 }
 
-async function preprocessAdaptive(imgBuffer, cfg) {
-  const { data, info } = await sharp(imgBuffer).removeAlpha().raw().toBuffer({ resolveWithObject: true });
-  const map = colourDistanceMap(data, info.width, info.height);
-  let pipe = sharp(map, { raw: { width: info.width, height: info.height, channels: 1 } });
-  if (cfg.blur) pipe = pipe.blur(cfg.blur);
-  pipe = pipe.normalize();
-  const g = await pipe.clone().raw().toBuffer();
-  const thr = otsuThreshold(g);
-  const scale = cfg.resize || 3;
-  const binPng = await pipe.resize(info.width * scale, info.height * scale)
-    .threshold(thr).negate().png().toBuffer();
-  // component filter on the binarised, upscaled image
-  const bi = await sharp(binPng).grayscale().raw().toBuffer({ resolveWithObject: true });
-  const bin = Buffer.from(bi.data).map(v => (v < 128 ? 0 : 255));
-  const cleaned = filterComponents(bin, bi.info.width, bi.info.height, cfg.minPx || 120);
-  // Tesseract expects document-like input: white margin, ~300dpi
-  return sharp(cleaned, { raw: { width: bi.info.width, height: bi.info.height, channels: 1 } })
-    .extend({ top: 40, bottom: 40, left: 40, right: 40, background: '#fff' })
-    .withMetadata({ density: 300 }).png().toBuffer();
-}
-
-// HELPER: run OCR for a single tile
-// TURBO MODE: multiple methods + early exit
+// ============================================
+// YARDIMCI: Tek bir kutu için OCR çalıştır
+// TURBO MOD: 5 yöntem + erken çıkış
 // ============================================
 async function runOCRWithVoting(imgBuffer, boxIndex) {
-  // Adaptive configs. One is usually enough (93% alone); the spread covers
-  // edge cases. Was 20 fixed-threshold colour configs at 74.1%.
+  // 12 OCR konfigürasyonu - TÜM RENKLER İÇİN OPTİMİZE (yeşil, pembe, turuncu, altın)
   const ocrConfigs = [
-    { name: 'cd_b2_cc120',  blur: 2,   resize: 3, minPx: 120 },
-    { name: 'cd_b2_cc60',   blur: 2,   resize: 3, minPx: 60 },
-    { name: 'cd_b3_cc120',  blur: 3,   resize: 3, minPx: 120 },
-    { name: 'cd_b15_cc120', blur: 1.5, resize: 3, minPx: 120 },
-    { name: 'cd_b2_cc200',  blur: 2,   resize: 3, minPx: 200 },
-    { name: 'cd_b25_cc80',  blur: 2.5, resize: 3, minPx: 80 },
+    // === TEMEL (en hızlı) ===
+    { name: 'fast_1', threshold: 150, resize: 2, contrast: 1.6, brightness: 1.2, normalize: true, sharpen: true },
+    { name: 'fast_2', threshold: 180, resize: 2, contrast: 2.0, brightness: 1.4, normalize: true, sharpen: true },
+
+    // === YEŞİL KANAL (yeşil yazı için PERFECT!) ===
+    { name: 'green', channel: 'green', threshold: 140, resize: 2, contrast: 2.0, brightness: 1.2, normalize: true, sharpen: true },
+
+    // === KIRMIZI KANAL + INVERT (pembe arka plan yakalar, invert ile yeşil yazı çıkar) ===
+    { name: 'red_inv', channel: 'red', threshold: 130, resize: 2, contrast: 1.8, brightness: 1.3, invert: true, normalize: true, sharpen: true },
+
+    // === YEŞİL ZEMİN + AÇIK YEŞİL YAZI (camouflage kombinasyon) ===
+    // Green channel işe yaramaz (hem bg hem yazı yeşil görünür), blue+invert ile kontrast sağlanır
+    { name: 'lightgreen_blue_inv', channel: 'blue', threshold: 120, resize: 2, contrast: 3.0, brightness: 1.5, invert: true, normalize: true, sharpen: true },
+    { name: 'lightgreen_red_inv', channel: 'red', threshold: 110, resize: 2, contrast: 3.0, brightness: 1.6, invert: true, normalize: true, sharpen: true },
+    { name: 'lightgreen_blue_2', channel: 'blue', threshold: 100, resize: 3, contrast: 3.5, brightness: 1.4, invert: true, normalize: true, sharpen: true, gamma: 0.8 },
+
+    // === PEMBE ZEMİN + CYAN/TURKUAZ YAZI (camouflage kombinasyon) ===
+    // Cyan = yüksek mavi, düşük kırmızı. Pembe zemin = yüksek kırmızı, orta mavi
+    // Blue channel'da: cyan yazı parlak, pembe zemin karanlık → mükemmel kontrast!
+    { name: 'cyan_blue_1', channel: 'blue', threshold: 130, resize: 2, contrast: 2.8, brightness: 1.4, normalize: true, sharpen: true },
+    { name: 'cyan_blue_2', channel: 'blue', threshold: 110, resize: 3, contrast: 3.2, brightness: 1.5, normalize: true, sharpen: true },
+    // Underline/çizgi varsa median ile sil, sonra blue channel oku
+    { name: 'cyan_median_blue', channel: 'blue', threshold: 120, resize: 2, contrast: 2.5, brightness: 1.4, median: 3, normalize: true, sharpen: true },
+    // Invert versiyonu (bazen ters kontrast daha iyi sonuç verir)
+    { name: 'cyan_blue_inv', channel: 'blue', threshold: 140, resize: 2, contrast: 3.0, brightness: 1.3, invert: true, normalize: true, sharpen: true },
+
+    // === PEMBE RAKAMLAR İÇİN YENİ KONFİGÜRASYONLAR ===
+    { name: 'pink_1', channel: 'red', threshold: 120, resize: 2, contrast: 2.5, brightness: 1.4, normalize: true, sharpen: true },
+    { name: 'pink_2', channel: 'red', threshold: 100, resize: 2, contrast: 3.0, brightness: 1.5, normalize: true, sharpen: true },
+
+    // === TURUNCU/ALTIN RAKAMLAR İÇİN YENİ KONFİGÜRASYONLAR ===
+    { name: 'orange_1', channel: 'red', threshold: 110, resize: 2, contrast: 2.2, brightness: 1.3, normalize: true, sharpen: true },
+    { name: 'orange_2', threshold: 140, resize: 2, contrast: 2.4, brightness: 1.4, normalize: true, sharpen: true, gamma: 1.2 },
+
+    // === MEDİAN (çizgili rakamlar) ===
+    { name: 'median', threshold: 160, resize: 2, contrast: 1.8, brightness: 1.3, median: 3, normalize: true, sharpen: true },
+
+    // === MAVİ KANAL ===
+    { name: 'blue', channel: 'blue', threshold: 150, resize: 2, contrast: 1.7, brightness: 1.3, normalize: true, sharpen: true },
+
+    // === DÜŞÜK THRESHOLD (koyu yazılar) ===
+    { name: 'low_thr', threshold: 100, resize: 2, contrast: 2.2, brightness: 1.5, normalize: true, sharpen: true },
+
+    // === YÜKSEK THRESHOLD + INVERT (açık yazılar) ===
+    { name: 'high_inv', threshold: 200, resize: 2, contrast: 1.8, brightness: 1.4, invert: true, normalize: true, sharpen: true },
+
+    // === RENK BAĞIMSIZ GENEL (tüm renkler için) ===
+    { name: 'universal', threshold: 130, resize: 3, contrast: 2.5, brightness: 1.3, normalize: true, sharpen: true, gamma: 1.1 },
   ];
 
-  // Collect results for voting
+  // Voting için sonuçları topla
   const results = {};
   const allResults = [];
-  const EARLY_EXIT_VOTES = 3; // stop once 3+ votes agree (for speed)
+  const EARLY_EXIT_VOTES = 3; // 3+ oy alınca dur (hız için)
 
   for (const config of ocrConfigs) {
     try {
       ocrStats.totalAttempts++;
 
-      // Process the image
-      const processedBuffer = await preprocessAdaptive(imgBuffer, config);
+      // Görüntüyü işle
+      const processedBuffer = await processImageForOCR(imgBuffer, config);
 
-      // Run OCR - digits-only optimisation
+      // OCR çalıştır - RAKAM-ONLY OPTİMİZASYONU
       const { data: { text, confidence } } = await Tesseract.recognize(
         processedBuffer,
         'eng',
         {
           logger: m => { },
           tessedit_char_whitelist: '0123456789',
-          tessedit_pageseg_mode: '7', // Single TEXT LINE. PSM 8 (single word) measured ~44% vs 94% here.
-          tessedit_ocr_engine_mode: '1', // LSTM only - faster
-          tessedit_create_hocr: '0', // disable HOCR output (for speed)
-          tessedit_create_tsv: '0', // disable TSV output (for speed)
-          tessedit_create_pdf: '0', // disable PDF output (for speed)
-          preserve_interword_spaces: '0', // do not preserve interword spaces (not needed for digits)
-          classify_bln_numeric_mode: '1', // numeric mode - optimised for digits only
-          textord_min_linesize: '2.5', // minimum line size (for small digits)
-          classify_enable_learning: '0' // disable adaptive learning (for speed)
+          tessedit_pageseg_mode: '8', // Single word mode - rakamlar için ideal
+          tessedit_ocr_engine_mode: '1', // LSTM only - daha hızlı
+          tessedit_create_hocr: '0', // HOCR çıktısını kapat (hız için)
+          tessedit_create_tsv: '0', // TSV çıktısını kapat (hız için)
+          tessedit_create_pdf: '0', // PDF çıktısını kapat (hız için)
+          preserve_interword_spaces: '0', // Kelime arası boşlukları koruma (rakamlar için gerekli değil)
+          classify_bln_numeric_mode: '1', // Numeric mode - sadece rakamlar için optimize
+          textord_min_linesize: '2.5', // Minimum satır boyutu (küçük rakamlar için)
+          classify_enable_learning: '0' // Öğrenmeyi kapat (hız için)
         }
       );
 
-      // Keep digits only
+      // Sadece rakamları al
       const cleanText = text.replace(/\D/g, '');
 
-      // Check whether it is 3 digits
+      // 3 haneli mi kontrol et
       if (/^\d{3}$/.test(cleanText)) {
         ocrStats.threeDigitReads++;
 
-        // Count for voting
+        // Voting için say
         if (!results[cleanText]) {
           results[cleanText] = { count: 0, configs: [], totalConfidence: 0 };
         }
@@ -188,17 +219,17 @@ async function runOCRWithVoting(imgBuffer, boxIndex) {
 
         allResults.push({ text: cleanText, config: config.name, confidence });
 
-        // EARLY EXIT: stop once enough votes agree
+        // ERKEN ÇIKIŞ: Yeterli oy alındıysa dur
         if (results[cleanText].count >= EARLY_EXIT_VOTES) {
           break;
         }
       }
     } catch (e) {
-      // Skip silently
+      // Sessizce atla
     }
   }
 
-  // Find the result with the most votes
+  // En çok oy alan sonucu bul
   let bestResult = null;
   let maxVotes = 0;
 
@@ -218,7 +249,7 @@ async function runOCRWithVoting(imgBuffer, boxIndex) {
 }
 
 // ============================================
-// MAIN FUNCTION: captcha solving
+// ANA FONKSİYON: Captcha çözme
 // ============================================
 async function solveCaptchaInIframe(driver, retryCount = 0, maxRetries = 3, isLoginCaptcha = false) {
   try {
@@ -226,11 +257,11 @@ async function solveCaptchaInIframe(driver, retryCount = 0, maxRetries = 3, isLo
       resetOCRStats();
     }
 
-    // Rate limiting check
+    // Rate limiting kontrolü
     try {
       const rateLimitElems = await driver.findElements(By.xpath("//*[contains(text(), 'maximum number of captcha request') or contains(text(), 'Please try after sometime')]"));
       if (rateLimitElems.length > 0) {
-        console.log('😤 Rate limited! Backing off... 30 second break ☕');
+        console.log('😤 Rate limiting! Biraz sakinleşelim... 30 saniye mola ☕');
         await driver.sleep(30000);
         await driver.navigate().refresh();
         await driver.sleep(5000);
@@ -241,16 +272,16 @@ async function solveCaptchaInIframe(driver, retryCount = 0, maxRetries = 3, isLo
       }
     } catch (e) { }
 
-    // Find the target number
+    // Hedef sayıyı bul
     const targetNumber = await findTargetNumber(driver);
 
-    // Select the tiles
-    await selectCaptchaBoxes(driver, targetNumber, isLoginCaptcha ? 'login' : 'entry');
+    // Kutuları seç
+    await selectCaptchaBoxes(driver, targetNumber);
 
     const successRate = calculateOCRSuccessRate();
-    // Very low success rate check
+    // Çok düşük başarı kontrolü
     if (successRate < 20 && ocrStats.targetMatches === 0 && ocrStats.totalAttempts > 50) {
-      console.log('⚠️ OCR success rate too low, aborting this captcha...');
+      console.log('⚠️ OCR başarı oranı çok düşük, captcha kesiliyor...');
       await driver.switchTo().defaultContent();
       return;
     }
@@ -258,7 +289,7 @@ async function solveCaptchaInIframe(driver, retryCount = 0, maxRetries = 3, isLo
     await driver.sleep(2000);
     await driver.switchTo().defaultContent();
 
-    // Alert check
+    // Alert kontrolü
     let alertPresent = false;
     try {
       while (true) {
@@ -290,43 +321,40 @@ async function solveCaptchaInIframe(driver, retryCount = 0, maxRetries = 3, isLo
       return await solveCaptchaInIframe(driver, retryCount + 1, maxRetries, isLoginCaptcha);
     }
 
-    // Invalid captcha check
+    // Invalid captcha kontrolü
     let invalid = false;
     try {
-      // 'Geçersiz' is Turkish for 'invalid' - kept because it matches the
-      // PORTAL's own error text on the Turkish deployment, not our output.
-      // Harmless on the English Pakistan portal; costs nothing to leave in.
       const errorElems = await driver.findElements(By.xpath("//*[contains(text(), 'Invalid captcha') or contains(text(), 'invalid captcha') or contains(text(), 'Geçersiz')]"));
       if (errorElems.length > 0) {
         invalid = true;
-        console.log('❌ Invalid captcha message found!');
+        console.log('❌ Invalid captcha mesajı bulundu!');
       }
 
       const modalOpen1 = await driver.findElements(By.css('iframe[title="Verify Selection"]'));
       const modalOpen2 = await driver.findElements(By.css('iframe[title="Verify Registration"]'));
       if ((modalOpen1.length > 0 || modalOpen2.length > 0) && !invalid) {
         invalid = true;
-        console.log('❌ CAPTCHA modal is still open!');
+        console.log('❌ CAPTCHA modal hala açık!');
       }
     } catch (e) { }
 
     if (invalid) {
-      // For the login captcha, rethrow to the caller (for the password check)
-      // Other captchas handle their own retry
+      // Login captcha ise üst seviyeye fırlat (password kontrolü için)
+      // Diğer captcha'lar için kendi retry'ını yap
       if (isLoginCaptcha) {
-        console.log('⚠️ Invalid login captcha - will retry at the caller (for the password check)');
-        throw new Error('Invalid captcha - password check required');
+        console.log('⚠️ Invalid login captcha - üst seviyede retry yapılacak (password kontrolü için)');
+        throw new Error('Invalid captcha - password kontrolü gerekli');
       } else if (retryCount < maxRetries) {
-        console.log(`🔄 Retrying captcha (${retryCount + 1}/${maxRetries})...`);
+        console.log(`🔄 Tekrar deneyelim! Pes etmiyoruz 💪 (${retryCount + 1}/${maxRetries})`);
         await driver.sleep(3000 + Math.random() * 3000);
         return await solveCaptchaInIframe(driver, retryCount + 1, maxRetries, isLoginCaptcha);
       } else {
-        console.log('😢 Max attempts exceeded, captcha not solved this time...');
+        console.log('😢 Maksimum deneme aşıldı, captcha bu sefer olmadı...');
       }
     } else {
       await driver.sleep(500);
 
-      // Clear any remaining alerts
+      // Kalan alertleri temizle
       try {
         while (true) {
           await driver.wait(until.alertIsPresent(), 1000);
@@ -336,19 +364,16 @@ async function solveCaptchaInIframe(driver, retryCount = 0, maxRetries = 3, isLo
         }
       } catch (e) { }
 
-      // DO NOT click #btnSubmit here.
-      //
-      // On the Pakistan portal, solving the entry captcha lands on the Visa
-      // Type Selection form, whose Submit button is also #btnSubmit. Clicking
-      // it here submitted the form EMPTY - producing "Please select appointment
-      // category", burning an appointment attempt, and breaking the Premium
-      // flow (the empty submit navigated away, so the redirect check failed and
-      // every retry then found no captcha).
-      //
-      // Submitting the form is app.js's job, after the dropdowns are filled.
+      // btnSubmit varsa tıkla
+      try {
+        await driver.wait(until.elementLocated(By.id('btnSubmit')), 5000);
+        const submitBtn = await driver.findElement(By.id('btnSubmit'));
+        await submitBtn.click();
+        console.log('✅ btnSubmit tıklandı');
+      } catch (e) { }
     }
   } catch (e) {
-    console.log(`❌ Captcha error: ${e.message}`);
+    console.log(`❌ Captcha hatası: ${e.message}`);
 
     // Alert temizle
     try {
@@ -359,48 +384,48 @@ async function solveCaptchaInIframe(driver, retryCount = 0, maxRetries = 3, isLo
 
         if (alertText.includes('maximum number of captcha request')) {
           await alert.accept();
-          console.log('😤 Rate limited! Throwing so the caller can retry...');
-          throw new Error('Rate limiting - page refresh required');
+          console.log('😤 Rate limiting! Hata fırlatılıyor, üst seviyede yeniden denenecek...');
+          throw new Error('Rate limiting - sayfa refresh gerekli');
         }
 
         await alert.accept();
         await driver.sleep(500);
       }
     } catch (e2) {
-      // e2 may be the error we threw - rethrow it
+      // e2 bizim fırlattığımız hata olabilir, tekrar fırlat
       if (e2.message && e2.message.includes('Rate limiting')) {
         throw e2;
       }
     }
 
-    // Login-captcha-specific errors - rethrow straight to the caller (for the password check)
+    // Login captcha için özel hatalar - direkt üst seviyeye fırlat (password kontrolü için)
     if (e.message && (
-      e.message.includes('password check required') ||
-      e.message.includes('Target number not found')
+      e.message.includes('password kontrolü gerekli') ||
+      e.message.includes('Hedef sayı bulunamadı')
     )) {
       if (isLoginCaptcha) {
-        console.log('🔄 Propagating the error to the caller (for the password check)...');
+        console.log('🔄 Hata üst seviyeye iletiliyor (password kontrolü için)...');
         throw e;
       }
     }
 
-    // Retry for other errors
+    // Diğer hatalar için retry yap
     if (retryCount < maxRetries) {
       console.log(`🔄 Tekrar deneniyor... (${retryCount + 1}/${maxRetries})`);
       return await solveCaptchaInIframe(driver, retryCount + 1, maxRetries, isLoginCaptcha);
     } else {
-      throw e; // Max attempts exceeded - propagate the error
+      throw e; // Maksimum deneme aşıldı, hatayı fırlat
     }
   }
 }
 
 // ============================================
-// Find the target number
+// Hedef sayıyı bul
 // ============================================
 async function findTargetNumber(driver) {
   let isInIframe = false;
 
-  // Find the target number text
+  // Hedef sayı metnini bul
   let labelDivs = await driver.findElements(By.css('div.box-label'));
 
   if (labelDivs.length === 0) {
@@ -446,10 +471,10 @@ async function findTargetNumber(driver) {
         frameHint = ' | no visible iframes - captcha is not frame-hosted.';
       }
     } catch (e) { }
-    throw new Error(`Target number text not found! (div.box-label not found)${frameHint}`);
+    throw new Error(`Hedef sayı metni bulunamadı! (div.box-label not found)${frameHint}`);
   }
 
-  // Take the topmost visible div
+  // En üstteki görünür div'i al
   visibleDivs.sort((a, b) => b.zIndex - a.zIndex || a.y - b.y);
   const visibleText = visibleDivs[0].text;
 
@@ -460,27 +485,23 @@ async function findTargetNumber(driver) {
     return match[1];
   }
 
-  throw new Error('Target number not found!');
+  throw new Error('Hedef sayı bulunamadı!');
 }
 
 // ============================================
-// Select the tiles - WITH THE VOTING SYSTEM
+// Kutuları seç - VOTING SİSTEMİ İLE
 // ============================================
-async function selectCaptchaBoxes(driver, targetNumber, kind = 'captcha') {
+async function selectCaptchaBoxes(driver, targetNumber) {
   let isInIframe = false;
 
-  // Harvest every tile of this challenge into ../captcha-lab/harvest/ so the
-  // offline corpus grows on every run. Saved regardless of outcome.
-  harvest.startChallenge(targetNumber, kind);
-
-  // Find the tiles
+  // Kutuları bul
   let boxImgs = await driver.findElements(By.css('div.col-4 img'));
 
   if (boxImgs.length === 0) {
     boxImgs = await driver.findElements(By.css('img[src*="data:image"]'));
   }
 
-  // Collect all tiles with position and z-index
+  // Tüm kutuları pozisyon ve z-index ile topla
   const allBoxes = [];
   for (let [i, img] of boxImgs.entries()) {
     try {
@@ -494,7 +515,7 @@ async function selectCaptchaBoxes(driver, targetNumber, kind = 'captcha') {
     } catch (e) { }
   }
 
-  // Group by position, take the topmost tile at each position
+  // Pozisyona göre grupla, her pozisyonda en üstteki kutuyu al
   const positionMap = {};
   for (const box of allBoxes) {
     if (!positionMap[box.posKey]) positionMap[box.posKey] = [];
@@ -518,36 +539,32 @@ async function selectCaptchaBoxes(driver, targetNumber, kind = 'captcha') {
     const { index: i, img, parentDiv } = box;
 
     try {
-      // Read the base64 image
+      // Base64 görüntüyü al
       const base64src = await img.getAttribute('src');
       if (!base64src || !base64src.includes('base64')) continue;
 
       const imgBuffer = Buffer.from(base64src.split(',')[1], 'base64');
 
-      // Run OCR with voting
+      // Voting ile OCR çalıştır
       const { bestResult } = await runOCRWithVoting(imgBuffer, i);
 
-      // Save the tile before acting on it. Unreadable tiles are saved too -
-      // those are the samples worth having.
-      harvest.saveTile(i, base64src, bestResult, bestResult && bestResult.text === targetNumber);
-
       if (bestResult) {
-        // Does it match the target number?
+        // Hedef sayı eşleşiyor mu?
         if (bestResult.text === targetNumber) {
           ocrStats.targetMatches++;
 
-          // 🛡️ CHECK IF ALREADY SELECTED - do not click if it has the img-selected class!
+          // 🛡️ ZATEN SEÇİLİ Mİ KONTROL ET - img-selected class'ı varsa tıklama!
           let alreadySelected = false;
           try {
             const imgClass = await img.getAttribute('class');
             if (imgClass && imgClass.includes('img-selected')) {
               alreadySelected = true;
-              clickedCount++; // Count it but do not click
+              clickedCount++; // Sayıya dahil et ama tıklama
             }
           } catch (e) { }
 
           if (!alreadySelected) {
-            // Click immediately - avoids a stale element
+            // HEMEN TIKLA - stale element olmadan
             let clicked = false;
             try {
               await parentDiv.click();
@@ -574,7 +591,7 @@ async function selectCaptchaBoxes(driver, targetNumber, kind = 'captcha') {
         }
       }
     } catch (e) {
-      // Continue silently
+      // Sessizce devam et
     }
   }
 
@@ -598,7 +615,7 @@ async function selectCaptchaBoxes(driver, targetNumber, kind = 'captcha') {
     } catch (e) { }
   }
 
-  // Last resort: call the JS function
+  // Son çare: JS fonksiyonu çağır
   if (!submitted) {
     try {
       await driver.executeScript('if(typeof onSubmit === "function") onSubmit();');
@@ -608,23 +625,14 @@ async function selectCaptchaBoxes(driver, targetNumber, kind = 'captcha') {
 
   const submitOk = submitted;
   console.log(
-    `Captcha ${targetNumber}: ${clickedCount}/${boxesToScan.length} tiles${submitOk ? ', submitted' : ', no submit'}`
+    `Captcha ${targetNumber}: ${clickedCount}/${boxesToScan.length} kutu${submitOk ? ', gönderildi' : ', submit yok'}`
   );
-
-  harvest.endChallenge({
-    submitted: submitOk,
-    clickedCount,
-    scanned: boxesToScan.length,
-  });
 
   await driver.sleep(2000);
   if (isInIframe) await driver.switchTo().defaultContent();
 }
 
 module.exports = {
-  // exported so ../captcha-lab can benchmark the real pipeline offline
-  preprocessAdaptive,
-  otsuThreshold,
   solveCaptchaInIframe,
   findTargetNumber,
   selectCaptchaBoxes,

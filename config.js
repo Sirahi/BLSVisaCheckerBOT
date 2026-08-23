@@ -1,29 +1,46 @@
 /**
- * BLS Visa Checker - Merkezi Konfigürasyon
- * Tüm statik değerler buradan yönetilir.
+ * BLS Visa Checker - Central configuration
+ * All static values are managed from here.
  */
 
+const BASE_URL = 'https://appointment.thespainvisa.com';
+
 module.exports = {
+    BASE_URL,
+
     // === URL ===
-    LOGIN_URL: 'https://turkey.blsspainglobal.com/Global/Account/LogIn',
+    LOGIN_URL: 'https://appointment.thespainvisa.com/Global/Account/LogIn',
     BOOK_NOW_URL: '/Global/appointment/newappointment',
     BLS_HOME_URL: '/Global/home/index',
-    VISA_TYPE_URL: '/Global/bls/visatype',
-    MY_APPOINTMENTS_URL: 'https://turkey.blsspainglobal.com/Global/appointmentdata/MyAppointments',
+    // The Pakistan form posts to /Global/Appointment/VisaType. The Turkey
+    // value was /Global/bls/visatype, which never matched - so the post-captcha
+    // "did we reach the form?" wait timed out every time and forced a retry.
+    // Compared case-insensitively (see urlIsForm in app.js).
+    VISA_TYPE_URL: '/Global/Appointment/VisaType',
+    MY_APPOINTMENTS_URL: 'https://appointment.thespainvisa.com/Global/appointmentdata/MyAppointments',
 
-    // === FORM DEĞERLERİ ===
+    // === FORM VALUES ===
+    // All values below confirmed against the live Intiana Pakistan portal,
+    // 2026-08-20. Matching is case-insensitive substring (see
+    // selectKendoDropdownByLabel in app.js), so these are chosen to be
+    // distinctive enough to match exactly one option each.
     FORM: {
-        VISA_TYPE: 'Schengen Visa/ Short Term Visa',
-        VISA_SUB_TYPE: 'Tourist Visa',
+        // Confirmed from live portal. Full option text is
+        // 'National Visa/ Long Term Visa'; we match on a distinctive substring
+        // so a whitespace difference around the slash cannot break it.
+        VISA_TYPE: 'National Visa',
+        // Confirmed. Full option text is 'Family Reunification Visa';
+        // this substring matches it and nothing else in the list.
+        VISA_SUB_TYPE: 'Family Reunification',
         CATEGORY_NORMAL: 'Normal',
         CATEGORY_PREMIUM: 'Premium',
     },
 
-    // === ŞEHİRLER (her oturumda sırayla taranır) ===
-    CITIES: [
-        { name: 'Ankara', JURISDICTION: 'Ankara', LOCATION: 'Ankara' },
-        { name: 'Istanbul', JURISDICTION: 'Istanbul', LOCATION: 'Istanbul' },
-    ],
+    // === CITY ===
+    // Single city only. The applicant's jurisdiction is set by hand in the
+    // portal profile; the bot never changes it. LOCATION fills the booking
+    // form's Location dropdown. The Pakistan form has NO Jurisdiction field.
+    CITY: { name: 'Islamabad', LOCATION: 'Islamabad' },
 
     // === RETRY & TIMEOUT ===
     RETRY: {
@@ -44,7 +61,7 @@ module.exports = {
         CALENDAR_NAV: 750,
     },
 
-    // === TAKVİM ===
+    // === CALENDAR ===
     CALENDAR: {
         MAX_MONTHS_TO_CHECK: 12,
     },
@@ -61,8 +78,8 @@ module.exports = {
         OCR_MIN_ATTEMPTS_FOR_CUT: 50,
     },
 
-    // === TELEGRAM BİLDİRİM METNİ (slot bulunduğunda) ===
+    // === TELEGRAM NOTIFICATION TEXT (when a slot is found) ===
     TELEGRAM: {
-        SLOT_OPEN_LINK: 'https://turkey.blsspainglobal.com/Global/Account/LogIn',
+        SLOT_OPEN_LINK: 'https://appointment.thespainvisa.com/Global/Account/LogIn',
     },
 };

@@ -1,10 +1,19 @@
 const axios = require("axios");
 require("dotenv").config();
+const CFG = require("./config");
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-// Temel mesaj gönderme fonksiyonu
+// Location and visa type are read from config rather than hardcoded, so these
+// notifications stay correct when the city or visa type changes.
+const LOCATION = (CFG.CITY && CFG.CITY.name) || "Unknown";
+const VISA_TYPE = CFG.FORM.VISA_TYPE;
+
+// Timestamp helper - 24-hour clock
+const stamp = () => new Date().toLocaleString('en-GB');
+
+// Base message-sending function
 const sendMessageToTelegram = async (message, parseMode = 'Markdown') => {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
 
@@ -24,21 +33,21 @@ const sendMessageToTelegram = async (message, parseMode = 'Markdown') => {
   }
 };
 
-// 🎉 RANDEVU BULUNDU - Yeşil tarihlerle
+// 🎉 APPOINTMENT FOUND - with the available dates
 const notifyAppointmentFound = async (availableDates) => {
-  // Category bilgisini al (varsa)
-  const category = availableDates.length > 0 && availableDates[0].category 
-    ? availableDates[0].category 
+  // Read the category if present
+  const category = availableDates.length > 0 && availableDates[0].category
+    ? availableDates[0].category
     : "Normal";
-  
+
   const categoryEmoji = category === "Premium" ? "⭐️" : "🎫";
-  
-  const header = "🎊🎉✨ *MUHTEŞEM HABER!* ✨🎉🎊\n";
-  const subHeader = "🇪🇸 *RANDEVU TARİHLERİ AÇILDI!* 🇪🇸\n\n";
-  
-  const summary = `🌟 *${availableDates.length} harika tarih seni bekliyor!*\n\n`;
-  
-  // Tarihleri aya göre grupla
+
+  const header = "🎊🎉✨ *GREAT NEWS!* ✨🎉🎊\n";
+  const subHeader = "🇪🇸 *APPOINTMENT DATES ARE OPEN!* 🇪🇸\n\n";
+
+  const summary = `🌟 *${availableDates.length} date(s) available!*\n\n`;
+
+  // Group the dates by month
   const datesByMonth = {};
   for (const dateObj of availableDates) {
     if (!datesByMonth[dateObj.month]) {
@@ -46,146 +55,146 @@ const notifyAppointmentFound = async (availableDates) => {
     }
     datesByMonth[dateObj.month].push(dateObj.text);
   }
-  
-  // Gruplanmış tarihleri ekle
-  let datesText = "📅 *Müsait Tarihler:*\n";
+
+  // Add the grouped dates
+  let datesText = "📅 *Available dates:*\n";
   for (const [month, dates] of Object.entries(datesByMonth)) {
     datesText += `\n🗓 *${month}*\n`;
     datesText += `   💚 ${dates.join(' • ')}\n`;
   }
-  
-  const location = "\n📍 *Nereden:* Ankara 🏛\n";
-  const visaType = "🎫 *Ne için:* Schengen Turist Vizesi ✈️\n";
-  const categoryInfo = `${categoryEmoji} *Kategori:* ${category}\n\n`;
-  
-  const action = "🚀 *HEMEN KOŞŞŞ:*\n";
-  const link = "🔗 [BLS Spain Portal'a Git!](https://turkey.blsspainglobal.com/Global/Account/LogIn)\n\n";
-  
-  const footer = "⏰ " + new Date().toLocaleString('tr-TR') + "\n";
-  const warning = "⚡️ _Hızlı ol! Randevular uçuyor!_ 🏃‍♂️💨";
-  
+
+  const location = `\n📍 *Location:* ${LOCATION} 🏛\n`;
+  const visaType = `🎫 *Visa type:* ${VISA_TYPE} ✈️\n`;
+  const categoryInfo = `${categoryEmoji} *Category:* ${category}\n\n`;
+
+  const action = "🚀 *GO NOW:*\n";
+  const link = `🔗 [Open the visa portal](${CFG.TELEGRAM.SLOT_OPEN_LINK})\n\n`;
+
+  const footer = "⏰ " + stamp() + "\n";
+  const warning = "⚡️ _Be quick! Appointments go fast._ 🏃‍♂️💨";
+
   const message = header + subHeader + summary + datesText + location + visaType + categoryInfo + action + link + footer + warning;
-  
+
   return await sendMessageToTelegram(message);
 };
 
-// 😔 HİÇBİR TARİH YOK
+// 😔 NO DATES AVAILABLE
 const notifyNoAppointments = async (monthsScanned) => {
-  const header = "😔 *Bugün de olmadı...*\n\n";
-  
-  const info = `🔍 ${monthsScanned} ay boyunca baktım\n`;
-  const result = "📅 Hiç müsait tarih yok şu an 😢\n\n";
-  
-  const location = "📍 Ankara\n";
-  const visaType = "🎫 Schengen Turist\n\n";
-  
-  const footer = "⏰ " + new Date().toLocaleString('tr-TR') + "\n";
-  const note = "💪 _Ama pes etmiyoruz! Aramaya devam..._";
-  
+  const header = "😔 *No luck this time...*\n\n";
+
+  const info = `🔍 Checked ${monthsScanned} month(s)\n`;
+  const result = "📅 No available dates right now 😢\n\n";
+
+  const location = `📍 ${LOCATION}\n`;
+  const visaType = `🎫 ${VISA_TYPE}\n\n`;
+
+  const footer = "⏰ " + stamp() + "\n";
+  const note = "💪 _Still watching. Will keep checking..._";
+
   const message = header + info + result + location + visaType + footer + note;
-  
+
   return await sendMessageToTelegram(message);
 };
 
-// 🔒 RANDEVULAR KAPALI
+// 🔒 APPOINTMENTS CLOSED
 const notifyAppointmentsClosed = async () => {
-  const header = "🔒 *Kapılar Kapalı* 🚪\n\n";
-  
-  const info = "😞 Randevu sistemi şu an kapalı\n";
-  const reason = "🇪🇸 İspanya bu kategori için randevu vermiyor\n\n";
-  
-  const location = "📍 Ankara\n";
-  const visaType = "🎫 Schengen Turist\n\n";
-  
-  const footer = "⏰ " + new Date().toLocaleString('tr-TR') + "\n";
-  const note = "🤞 _Umarım yakında açılır, gözüm üstünde!_";
-  
+  const header = "🔒 *Doors Closed* 🚪\n\n";
+
+  const info = "😞 The appointment system is currently closed\n";
+  const reason = "🇪🇸 Spain is not issuing appointments for this category\n\n";
+
+  const location = `📍 ${LOCATION}\n`;
+  const visaType = `🎫 ${VISA_TYPE}\n\n`;
+
+  const footer = "⏰ " + stamp() + "\n";
+  const note = "🤞 _Hopefully it opens soon - still watching._";
+
   const message = header + info + reason + location + visaType + footer + note;
-  
+
   return await sendMessageToTelegram(message);
 };
 
-// 🤔 FORM DOLDURMA HATASI
+// 🤔 FORM FILLING ERROR
 const notifyFormError = async (errorStep) => {
-  const header = "🤔 *Bir Aksilik Oldu*\n\n";
-  
-  const error = `📝 Form doldurulamadı:\n_${errorStep}_\n\n`;
-  
-  const footer = "⏰ " + new Date().toLocaleString('tr-TR') + "\n";
-  const note = "🔄 _Sorun değil, tekrar denerim!_";
-  
+  const header = "🤔 *Something Went Wrong*\n\n";
+
+  const error = `📝 Could not fill the form:\n_${errorStep}_\n\n`;
+
+  const footer = "⏰ " + stamp() + "\n";
+  const note = "🔄 _No problem, I will try again._";
+
   const message = header + error + footer + note;
-  
+
   return await sendMessageToTelegram(message);
 };
 
-// 🧩 CAPTCHA HATASI
+// 🧩 CAPTCHA ERROR
 const notifyCaptchaError = async (retryCount) => {
-  const header = "🧩 *Captcha Zor Geldi* 😅\n\n";
-  
-  const info = `🔢 Deneme: ${retryCount}/3\n`;
-  const status = "🤖 O bulmacayı çözemedim bu sefer\n\n";
-  
-  const footer = "⏰ " + new Date().toLocaleString('tr-TR') + "\n";
-  const note = "🎯 _Bir daha deniyorum, bu sefer çözerim!_";
-  
+  const header = "🧩 *Captcha Was Too Hard* 😅\n\n";
+
+  const info = `🔢 Attempt: ${retryCount}/3\n`;
+  const status = "🤖 Could not solve the puzzle this time\n\n";
+
+  const footer = "⏰ " + stamp() + "\n";
+  const note = "🎯 _Trying again - hopefully I get it next time._";
+
   const message = header + info + status + footer + note;
-  
+
   return await sendMessageToTelegram(message);
 };
 
-// 🚀 BOT BAŞLADI
+// 🚀 BOT STARTED
 const notifyBotStarted = async () => {
-  const header = "🚀 *Merhaba! Göreve Hazırım* 👋\n\n";
-  
-  const info = "🤖 İspanya vizesi avcısı aktif!\n\n";
-  
-  const settings = "⚙️ *Ne yapıyorum:*\n";
-  const location = "   📍 Ankara'dan bakıyorum\n";
-  const visaType = "   🎫 Schengen Turist arıyorum\n";
-  const interval = "   ⏱ Her 10 dakika kontrol\n\n";
-  
-  const footer = "⏰ " + new Date().toLocaleString('tr-TR') + "\n";
-  const note = "🔔 _Randevu açılınca hemen haber veririm!_ ✨";
-  
+  const header = "🚀 *Hello! Ready To Go* 👋\n\n";
+
+  const info = "🤖 Spain visa hunter is active!\n\n";
+
+  const settings = "⚙️ *What I am doing:*\n";
+  const location = `   📍 Watching ${LOCATION}\n`;
+  const visaType = `   🎫 Looking for ${VISA_TYPE}\n`;
+  const interval = "   ⏱ Checking on the configured schedule\n\n";
+
+  const footer = "⏰ " + stamp() + "\n";
+  const note = "🔔 _I will let you know as soon as a slot opens!_ ✨";
+
   const message = header + info + settings + location + visaType + interval + footer + note;
-  
+
   return await sendMessageToTelegram(message);
 };
 
-// 😵 BOT DURDURULDU / HATA
+// 😵 BOT STOPPED / ERROR
 const notifyBotError = async (errorMessage) => {
-  const header = "😵 *Hay aksi! Bir şeyler ters gitti*\n\n";
-  
+  const header = "😵 *Something went wrong*\n\n";
+
   const error = `🐛 _${errorMessage}_\n\n`;
-  
-  const footer = "⏰ " + new Date().toLocaleString('tr-TR') + "\n";
-  const note = "🔧 _Kendimi tamir edip geliyorum!_ 🏃‍♂️";
-  
+
+  const footer = "⏰ " + stamp() + "\n";
+  const note = "🔧 _Recovering and coming back._ 🏃‍♂️";
+
   const message = header + error + footer + note;
-  
+
   return await sendMessageToTelegram(message);
 };
 
-// 🔔 SLOT SAYFASI AÇIK AMA OKUNAMIYOR
+// 🔔 SLOT PAGE REACHED BUT NOT READABLE
 const notifySlotPageReached = async (errorDetail) => {
-  const header = "🔔🔔🔔 *DİKKAT!* 🔔🔔🔔\n\n";
-  
-  const good = "✅ *SLOT SEÇİM SAYFASINA ULAŞILDI!*\n\n";
-  const bad = `⚠️ Takvim okunamadı: _${errorDetail}_\n\n`;
-  
-  const important = "🚨 *BU ÖNEMLİ!*\n";
-  const meaning = "📅 Slot seçim sayfası açık = Randevu VAR olabilir!\n\n";
-  
-  const action = "👉 *HEMEN MANUEL KONTROL ET:*\n";
-  const link = "🔗 [BLS Spain Portal](https://turkey.blsspainglobal.com/Global/Account/LogIn)\n\n";
-  
-  const location = "📍 Ankara | 🎫 Schengen Turist\n";
-  const footer = "⏰ " + new Date().toLocaleString('tr-TR') + "\n\n";
-  const note = "⚡️ _Bot takvimi okuyamadı ama sen bakabilirsin!_";
-  
+  const header = "🔔🔔🔔 *ATTENTION!* 🔔🔔🔔\n\n";
+
+  const good = "✅ *REACHED THE SLOT SELECTION PAGE!*\n\n";
+  const bad = `⚠️ Could not read the calendar: _${errorDetail}_\n\n`;
+
+  const important = "🚨 *THIS MATTERS!*\n";
+  const meaning = "📅 The slot selection page being open means appointments MAY be available!\n\n";
+
+  const action = "👉 *CHECK MANUALLY NOW:*\n";
+  const link = `🔗 [Open the visa portal](${CFG.TELEGRAM.SLOT_OPEN_LINK})\n\n`;
+
+  const location = `📍 ${LOCATION} | 🎫 ${VISA_TYPE}\n`;
+  const footer = "⏰ " + stamp() + "\n\n";
+  const note = "⚡️ _The bot could not read the calendar, but you can._";
+
   const message = header + good + bad + important + meaning + action + link + location + footer + note;
-  
+
   return await sendMessageToTelegram(message);
 };
 

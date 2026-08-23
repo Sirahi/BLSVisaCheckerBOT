@@ -6,7 +6,6 @@ const {
 } = require("./telegramNotifier");
 const CFG = require("./config");
 const MSG = require("./messages");
-const { saveLastCity, loadLastCity, getOrderedCities, isLocationAlreadySet } = require("./stateManager");
 
 require("dotenv").config();
 
@@ -14,7 +13,7 @@ const EMAIL = process.env.EMAIL;
 const PASSWORD = process.env.PASSWORD;
 
 async function main() {
-  // "Application Temporarily Unavailable" hatasını kontrol et ve düzelt
+  // Check for and recover from the "Application Temporarily Unavailable" error
   async function checkAndHandleUnavailable(driver) {
     try {
       const pageSource = await driver.getPageSource();
@@ -34,7 +33,7 @@ async function main() {
     }
   }
 
-  // Yeni dropdown seçim fonksiyonu - LABEL TEXT'e göre
+  // Dropdown selection function - matches by LABEL TEXT
   async function selectKendoDropdownByLabel(
     driver,
     labelText,
@@ -44,38 +43,38 @@ async function main() {
     const targetText = visibleText.trim().toLowerCase();
 
     try {
-      // Tüm label elementlerini bul
+      // Find all label elements
       const allLabels = await driver.findElements(By.css('label.form-label'));
 
       let targetDropdown = null;
 
-      // Her label'ı kontrol et
+      // Check each label
       for (const label of allLabels) {
         try {
           const labelTextContent = await label.getText();
 
-          // Label text'i eşleşiyor mu?
+          // Does the label text match?
           if (labelTextContent.includes(labelText)) {
-            // Parent div'i bul
+            // Find the parent div
             const parentDiv = await label.findElement(By.xpath('..'));
 
-            // Parent görünür mü?
+            // Is the parent visible?
             const isDisplayed = await parentDiv.isDisplayed();
             if (!isDisplayed) {
-              continue; // Gizli, bir sonrakine geç
+              continue; // Hidden - move to the next one
             }
 
-            // Dropdown'u bul (parent div içinde)
+            // Find the dropdown (inside the parent div)
             try {
               targetDropdown = await parentDiv.findElement(By.css('span.k-dropdown-wrap'));
               break;
             } catch (e) {
-              // Bu div'de dropdown yok, devam et
+              // No dropdown in this div - continue
               continue;
             }
           }
         } catch (e) {
-          // Label okunamadı, devam et
+          // Could not read the label - continue
           continue;
         }
       }
@@ -85,15 +84,16 @@ async function main() {
         return false;
       }
 
-      // Dropdown'a tıkla
+      // Click the dropdown
       await driver.executeScript("arguments[0].scrollIntoView({block: 'center'});", targetDropdown);
       await driver.sleep(CFG.SLEEP.SHORT);
       await driver.executeScript("arguments[0].click();", targetDropdown);
       await driver.sleep(400);
 
-      // Seçenekleri bul
+      // Find the options
       let found = false;
       let start = Date.now();
+      const seenOptions = new Set(); // PK: record real option text for config discovery
 
       while (Date.now() - start < timeout) {
         const allLists = await driver.findElements(
@@ -111,6 +111,7 @@ async function main() {
               for (const item of items) {
                 try {
                   const txt = (await item.getText()).trim();
+                  if (txt) seenOptions.add(txt);
                   if (txt && (txt.toLowerCase() === targetText || txt.toLowerCase().includes(targetText))) {
                     await driver.executeScript("arguments[0].scrollIntoView({block: 'center'});", item);
                     await driver.sleep(150);
@@ -136,6 +137,18 @@ async function main() {
 
       if (!found) {
         console.log(MSG.DROPDOWN_NOT_SELECTED(labelText, visibleText));
+        // The Pakistan portal's option text differs from Turkey's and is not in
+        // the saved captures (Kendo loads it by AJAX). Print what is actually
+        // there so config.js can be filled in from one run.
+        const opts = [...seenOptions];
+        if (opts.length) {
+          console.log(`    >>> "${labelText}" actual options (${opts.length}):`);
+          opts.forEach((o) => console.log(`          ${JSON.stringify(o)}`));
+          console.log(`    >>> put the matching one in config.js`);
+        } else {
+          console.log(`    >>> "${labelText}" list never rendered - dropdown did not open,`);
+          console.log(`    >>> or the previous dropdown must be set first (cascading).`);
+        }
       }
       return found;
 
@@ -146,231 +159,67 @@ async function main() {
   }
 
   // ============================================================
-  // MyAppointments sayfasında başvuru sahibi konumunu ayarla
+  // Dismiss whatever modal the portal just threw up.
+  //
+  // Selecting certain dropdown values opens a Bootstrap modal that overlays the
+  // form and blocks every dropdown below it:
+  //   Visa Type = National  -> #NationalVisaModal   ("Ok")
+  //   Category  = Premium   -> #PremiumTypeModel    ("Reject" / "Accept")
+  //
+  // ~10 modals are pre-rendered on the page and only one is ever visible, so
+  // nothing may be selected by id or document order - the visible one is
+  // resolved at runtime. The button to click is always .btn-success
+  // ("Ok" / "Accept"); .btn-danger is Reject and must never be clicked.
   // ============================================================
-  async function setApplicantLocation(driver, city) {
-      console.log(MSG.LOCATION_SET_STARTING(city.name));
+  // URL comparison must be case-insensitive: the portal serves
+  // /Global/Appointment/VisaType but redirects can vary the casing.
+  function urlIsForm(url) {
+    return (url || '').toLowerCase().includes(CFG.VISA_TYPE_URL.toLowerCase());
+  }
 
+  async function dismissVisibleModal(driver, context = '') {
     try {
-      // 1. MyAppointments sayfasına git
-      await driver.get(CFG.MY_APPOINTMENTS_URL);
-      await driver.sleep(CFG.SLEEP.AFTER_LOGIN);
-      await checkAndHandleUnavailable(driver);
-      await driver.sleep(CFG.SLEEP.LONG);
-
-      // 2. Edit (ManageApplicant) butonuna tıkla - "Primary Applicant" veya ilk görünür olanı seç
-      let editBtn = null;
-
-      try {
-        // "Primary Applicant" yazan kişinin detay satırını bul (Ayrıca 'Add New Member' butonunu ekarte eder)
-        editBtn = await driver.findElement(
-          By.xpath("//div[contains(@class, 'row') and contains(@class, 'border') and contains(., 'Primary Applicant')]//a[contains(@onclick, 'ManageApplicant')]")
-        );
-      } catch (e) {
-        // Fallback 1: onclick'te ManageApplicant geçen herhangi bir <a>
+      const modals = await driver.findElements(By.css('div.modal'));
+      for (const modal of modals) {
+        let visible = false;
         try {
-          const editBtns = await driver.findElements(By.css('a[onclick*="ManageApplicant"]'));
-          for (const btn of editBtns) {
-            if (await btn.isDisplayed()) { editBtn = btn; break; }
+          visible = await modal.isDisplayed();
+          if (visible) {
+            const disp = await modal.getCssValue('display');
+            visible = disp !== 'none';
           }
-        } catch (_) { }
-      }
+        } catch (e) { continue; }
+        if (!visible) continue;
 
-      // Fallback 2: "Edit" metnine sahip herhangi görünür buton/link
-      if (!editBtn) {
+        // Log what it said, so unexpected modals are not silently accepted.
+        let title = '';
         try {
-          const allEdits = await driver.findElements(
-            By.xpath("//a[contains(@class,'btn') and (contains(text(),'Edit') or contains(@title,'Edit'))] | //button[contains(text(),'Edit')]")
-          );
-          for (const btn of allEdits) {
-            if (await btn.isDisplayed()) { editBtn = btn; break; }
-          }
-        } catch (_) { }
-      }
+          const h = await modal.findElement(By.css('.modal-title'));
+          title = (await h.getText()).trim();
+        } catch (e) { }
 
-      if (!editBtn) throw new Error('Edit butonu bulunamadı veya tıklanamadı');
+        let btn = null;
+        try {
+          btn = await modal.findElement(By.css('.modal-footer .btn-success'));
+        } catch (e) {
+          try { btn = await modal.findElement(By.css('.btn-success')); } catch (e2) { }
+        }
+        if (!btn) continue;
 
-      await driver.executeScript("arguments[0].scrollIntoView({block: 'center'});", editBtn);
-      await driver.sleep(CFG.SLEEP.SHORT);
-      await driver.executeScript("arguments[0].click();", editBtn);
-      console.log(MSG.LOCATION_SET_EDIT_CLICKED);
-
-      // ─────────────────────────────────────────────────────────────
-      // AŞAMA A: Bootstrap modal (ana DOM'da — iframe YOK)
-      //   Yapı:  div.modal-content > div.modal-body  (Location + Visa Type)
-      //                            > div.modal-footer > button "Proceed"
-      // ─────────────────────────────────────────────────────────────
-
-      // Modal'ın açılmasını bekle
-      await driver.sleep(1000);
-      await driver.wait(
-        until.elementLocated(By.css('div.modal-content')),
-        CFG.DROPDOWN.TIMEOUT
-      );
-      console.log(MSG.LOCATION_SET_POPUP_READY);
-      await driver.sleep(CFG.SLEEP.MEDIUM);
-
-      // 3. Location dropdown'unu şehre göre set et (ana DOM / Bootstrap modal)
-      const locationSet = await selectKendoDropdownByLabel(driver, 'Location', city.LOCATION);
-      if (!locationSet) throw new Error(`Location "${city.LOCATION}" seçilemedi`);
-      console.log(MSG.LOCATION_SET_DROPDOWN_SET(city.name));
-      await driver.sleep(CFG.SLEEP.LONG);
-
-      // 4. Visa Type kontrol et - Schengen Visa olmalı (ana DOM)
-      let currentVisaType = '';
-      try {
-        const visaTypeInput = await driver.findElement(By.css('span[aria-owns="VisaType_listbox"] .k-input, .k-input[aria-controls="VisaType_listbox"]'));
-        currentVisaType = await visaTypeInput.getText();
-      } catch (_) { /* okunamazsa boş kalır */ }
-
-      if (currentVisaType.includes('Schengen')) {
-        console.log(MSG.LOCATION_SET_VISA_TYPE_OK);
-      } else {
-        const visaSet = await selectKendoDropdownByLabel(driver, 'Visa Type', CFG.FORM.VISA_TYPE);
-        if (!visaSet) throw new Error('Visa Type seçilemedi');
-        console.log(MSG.LOCATION_SET_VISA_TYPE_SET);
+        const label = (await btn.getText().catch(() => '')).trim() || 'button';
+        try {
+          await btn.click();
+        } catch (e) {
+          await driver.executeScript('arguments[0].click();', btn);
+        }
+        console.log(`\u2705 Modal dismissed${context ? ' after ' + context : ''}: "${title}" -> ${label}`);
         await driver.sleep(CFG.SLEEP.MEDIUM);
+        return true;
       }
-
-      // 5. Proceed butonuna tıkla — ana DOM'daki modal-footer içinde
-      //    <button class="btn btn-success" type="button" onclick="VisaTypeProceed();">Proceed</button>
-      const proceedBtn = await driver.findElement(
-        By.xpath("//div[contains(@class,'modal-footer')]//button[contains(text(),'Proceed')]")
-      );
-      await driver.executeScript("arguments[0].scrollIntoView({block: 'center'});", proceedBtn);
-      await driver.sleep(CFG.SLEEP.SHORT);
-      await driver.executeScript("arguments[0].click();", proceedBtn);
-      console.log(MSG.LOCATION_SET_PROCEED_CLICKED);
-
-      // ─────────────────────────────────────────────────────────────
-      // AŞAMA B: Kendo Window + iframe (ManageApplicant)
-      //   Proceed → VisaTypeProceed() → Kendo Window açılır
-      //   İçinde:  <iframe class="k-content-frame" src="/Global/appointmentdata/ManageApplicant?...">
-      //   Submit butonu bu iframe içindedir.
-      // ─────────────────────────────────────────────────────────────
-
-      // iframe'in DOM'a girmesini bekle
-      await driver.sleep(2000);
-      await driver.wait(
-        until.elementLocated(By.css('iframe.k-content-frame')),
-        CFG.DROPDOWN.TIMEOUT
-      );
-      await driver.sleep(500);
-
-      // iframe'e geç
-      const popupIframe = await driver.findElement(By.css('iframe.k-content-frame'));
-      await driver.switchTo().frame(popupIframe);
-
-      // iframe içindeki içeriğin yüklenmesini bekle
-      await driver.sleep(1000);
-
-      // 6. Submit butonunu bul (iframe context'inde) — birden fazla strateji
-      let submitBtn = null;
-
-      // Strateji 1: btn-primary + "Submit" metni
-      try {
-        const s1 = await driver.findElements(
-          By.xpath("//button[contains(@class,'btn-primary') and normalize-space(text())='Submit']")
-        );
-        for (const btn of s1) {
-          if (await btn.isDisplayed()) { submitBtn = btn; break; }
-        }
-      } catch (_) { }
-
-      // Strateji 2: type=submit + btn-primary
-      if (!submitBtn) {
-        try {
-          const s2 = await driver.findElements(
-            By.xpath("//button[@type='submit' and contains(@class,'btn-primary')]")
-          );
-          for (const btn of s2) {
-            if (await btn.isDisplayed()) { submitBtn = btn; break; }
-          }
-        } catch (_) { }
-      }
-
-      // Strateji 3: Herhangi görünür type=submit butonu
-      if (!submitBtn) {
-        try {
-          const s3 = await driver.findElements(By.xpath("//button[@type='submit']"));
-          for (const btn of s3) {
-            if (await btn.isDisplayed()) { submitBtn = btn; break; }
-          }
-        } catch (_) { }
-      }
-
-      // Strateji 4: JS ile iframe document içindeki butonları tara
-      if (!submitBtn) {
-        console.log('⚠️ Selenium ile Submit bulunamadı, JS ile deneniyor...');
-        try {
-          await driver.executeScript(`
-            var btns = document.querySelectorAll('button[type="submit"], button.btn-primary');
-            for (var b of btns) {
-              if (b.offsetParent !== null) { b.click(); break; }
-            }
-          `);
-          console.log(MSG.LOCATION_SET_SUBMIT_CLICKED);
-          await driver.sleep(1000);
-          submitBtn = 'clicked_via_js'; // sentinel
-        } catch (jsErr) {
-          console.log('⚠️ JS click de başarısız: ' + jsErr.message);
-        }
-      }
-
-      if (!submitBtn) {
-        await driver.switchTo().defaultContent();
-        throw new Error('Submit butonu hiçbir strateji ile bulunamadı!');
-      }
-
-      if (submitBtn !== 'clicked_via_js') {
-        await driver.executeScript("arguments[0].scrollIntoView({block: 'center'});", submitBtn);
-        await driver.sleep(CFG.SLEEP.SHORT);
-        await driver.executeScript("arguments[0].click();", submitBtn);
-        console.log(MSG.LOCATION_SET_SUBMIT_CLICKED);
-        await driver.sleep(500); // kısa bekle — alert hızlı açılıyor
-      }
-
-      // 7. Alert'i kabul et — alert açıkken switchTo().defaultContent() da throw eder!
-      //    Bu yüzden önce alert'i kontrol et, sonra context'e dön.
-      try {
-        // Çok hızlı gelen alert'i yakalamak için kısa bir wait ile dene
-        await driver.wait(until.alertIsPresent(), 3000);
-        const alert = await driver.switchTo().alert();
-        await alert.accept();
-        console.log(MSG.LOCATION_SET_ALERT_CLOSED);
-      } catch (_) {
-        // Alert henüz açılmadı — iframe'den çık, sonra tekrar dene
-        try {
-          await driver.switchTo().defaultContent();
-        } catch (switchErr) {
-          // defaultContent geçişi de fail ederse alert vardır, yakala
-          try {
-            const lateAlert = await driver.switchTo().alert();
-            await lateAlert.accept();
-            console.log(MSG.LOCATION_SET_ALERT_CLOSED);
-          } catch (_2) { /* alert yoksa önemsiz */ }
-        }
-        // Son bir kez daha alert var mı diye bak
-        try {
-          await driver.wait(until.alertIsPresent(), 2000);
-          const alert2 = await driver.switchTo().alert();
-          await alert2.accept();
-          console.log(MSG.LOCATION_SET_ALERT_CLOSED);
-        } catch (_) {
-          console.log('⚠️ Alert beklendi ama gelmedi, devam ediliyor...');
-        }
-      }
-
-      // Her koşulda ana context'e dön (zaten dönülmüş olabilir, try ile safe)
-      try { await driver.switchTo().defaultContent(); } catch (_) { }
-
-      await driver.sleep(CFG.SLEEP.AFTER_LOGIN);
-      console.log(MSG.LOCATION_SET_DONE(city.name));
-
     } catch (e) {
-      console.log(MSG.LOCATION_SET_ERROR(e.message));
-      throw e; // Konum ayarlanamadıysa şehri atla
+      console.log(`\u26a0\ufe0f Modal check failed (non-critical): ${e.message}`);
     }
+    return false;
   }
 
   // Premium Category'yi deneme fonksiyonu
@@ -380,7 +229,7 @@ async function main() {
     let tryAgainClicked = false;
 
     try {
-      // Önce "Try Again" linkini ara
+      // Look for the "Try Again" link first
       const tryAgainLinks = await driver.findElements(By.xpath("//a[contains(text(), 'Try Again') or contains(text(), 'try again')]"));
 
       if (tryAgainLinks.length > 0) {
@@ -401,7 +250,7 @@ async function main() {
         }
       }
 
-      // Link bulunamadıysa buton ara
+      // If no link was found, look for a button
       if (!tryAgainClicked) {
         const tryAgainBtns = await driver.findElements(By.xpath("//button[contains(text(), 'Try Again') or contains(text(), 'try again')]"));
 
@@ -432,22 +281,22 @@ async function main() {
       }
     } catch (e) {
       console.log(MSG.TRY_AGAIN_FAILED(e.message));
-      throw new Error("Try Again işlemi başarısız");
+      throw new Error("Try Again action failed");
     }
 
     await driver.sleep(1500);
 
-    // 2. "Application Temporarily Unavailable" kontrolü
+    // 2. "Application Temporarily Unavailable" check
     await checkAndHandleUnavailable(driver);
 
-    // 3. Captcha kontrolü (randevu sayfası)
+    // 3. Captcha check (appointment page)
     console.log(MSG.PREMIUM_CAPTION_PAGE_CHECKING);
     await driver.sleep(CFG.SLEEP.LONG);
 
     const currentUrl = await driver.getCurrentUrl();
     const pageSource = await driver.getPageSource();
 
-    // Form sayfasında mıyız?
+    // Are we on the form page?
     const hasFormTitle = pageSource.includes('Book New Appointment - Visa Type Selection');
 
     if (!hasFormTitle && !currentUrl.includes('/Global/bls/visatype')) {
@@ -466,11 +315,11 @@ async function main() {
 
           await solveCaptchaInIframe(driver);
 
-          // Captcha sonrası kontrol
+          // Post-captcha check
           await driver.sleep(1000);
           await checkAndHandleUnavailable(driver);
 
-          // Form sayfasına gidildi mi?
+          // Did we reach the form page?
           await driver.sleep(1500);
           const afterCaptchaUrl = await driver.getCurrentUrl();
           const afterCaptchaPage = await driver.getPageSource();
@@ -480,7 +329,7 @@ async function main() {
             console.log(MSG.CAPTCHA_FORM_SUCCESS);
             captchaSuccess = true;
           } else {
-            throw new Error("Form sayfasına yönlendirilemedi");
+            throw new Error("Could not be redirected to the form page");
           }
 
         } catch (e) {
@@ -488,7 +337,7 @@ async function main() {
           console.log(MSG.PREMIUM_CAPTCHA_FAILED(e.message));
 
           if (captchaRetries >= maxCaptchaRetries) {
-            throw new Error("Captcha çözülemedi - maksimum deneme aşıldı");
+            throw new Error("Could not solve captcha - max attempts exceeded");
           }
 
           await driver.sleep(1500);
@@ -501,46 +350,49 @@ async function main() {
     await driver.sleep(1000);
     await checkAndHandleUnavailable(driver);
 
-    // 4. Form doldurma - Premium seçimi
+    // 4. Form filling - Premium selection
     console.log(MSG.PREMIUM_FORM_FILLING);
 
     await driver.wait(until.elementLocated(By.css("span.k-dropdown-wrap")), CFG.DROPDOWN.TIMEOUT);
     await driver.sleep(CFG.SLEEP.MEDIUM);
 
     const formSuccess = {
-      jurisdiction: false,
       location: false,
       visaType: false,
       visaSubType: false,
       category: false
     };
 
-    formSuccess.jurisdiction = await selectKendoDropdownByLabel(driver, "Jurisdiction", city.JURISDICTION);
-    if (!formSuccess.jurisdiction) throw new Error("Premium: Jurisdiction seçilemedi");
-    await driver.sleep(CFG.SLEEP.SHORT);
-
+    // No Jurisdiction dropdown on the Pakistan portal - the form starts at
+    // Location. Jurisdiction is a Turkey-only field.
     formSuccess.location = await selectKendoDropdownByLabel(driver, "Location", city.LOCATION);
-    if (!formSuccess.location) throw new Error("Premium: Location seçilemedi");
+    if (!formSuccess.location) throw new Error("Premium: could not select Location");
+    await dismissVisibleModal(driver, "Location");
     await driver.sleep(CFG.SLEEP.SHORT);
 
     formSuccess.visaType = await selectKendoDropdownByLabel(driver, "Visa Type", CFG.FORM.VISA_TYPE);
-    if (!formSuccess.visaType) throw new Error("Premium: Visa Type seçilemedi");
+    if (!formSuccess.visaType) throw new Error("Premium: could not select Visa Type");
+    await dismissVisibleModal(driver, "Visa Type");
     await driver.sleep(CFG.SLEEP.SHORT);
 
     formSuccess.visaSubType = await selectKendoDropdownByLabel(driver, "Visa Sub Type", CFG.FORM.VISA_SUB_TYPE);
-    if (!formSuccess.visaSubType) throw new Error("Premium: Visa Sub Type seçilemedi");
+    if (!formSuccess.visaSubType) throw new Error("Premium: could not select Visa Sub Type");
+    await dismissVisibleModal(driver, "Visa Sub Type");
     await driver.sleep(CFG.SLEEP.SHORT);
 
     formSuccess.category = await selectKendoDropdownByLabel(driver, "Category", CFG.FORM.CATEGORY_PREMIUM);
-    if (!formSuccess.category) throw new Error("Premium: Category seçilemedi");
+    if (!formSuccess.category) throw new Error("Premium: could not select Category");
+    // Selecting Premium opens #PremiumTypeModel. Accept it here; the block
+    // below is a second pass that also logs the message text.
+    await dismissVisibleModal(driver, "Category");
     await driver.sleep(CFG.SLEEP.MEDIUM);
 
-    // 6. PREMIUM MODAL DIALOG KONTROLÜ VE ACCEPT
+    // 6. PREMIUM MODAL DIALOG CHECK AND ACCEPT
     try {
-      // Modal'ın açılmasını bekle
+      // Wait for the modal to open
       await driver.sleep(1000);
 
-      // Modal body'yi ara
+      // Look for the modal body
       const modalBodies = await driver.findElements(By.css('.modal-body, .scam-body'));
       let modalFound = false;
 
@@ -550,21 +402,21 @@ async function main() {
           if (isDisplayed) {
             const text = await modalBody.getText();
 
-            // Premium Lounge mesajı var mı?
+            // Is there a Premium Lounge message?
             if (text.includes('Premium Lounge') || text.includes('optional service')) {
               console.log(MSG.PREMIUM_MODAL_SUMMARY(text));
               modalFound = true;
 
               // Accept butonu ara
-              // Önce modal içindeki success butonunu ara
+              // Look for the success button inside the modal first
               let acceptBtns = await driver.findElements(By.css('.modal-footer .btn-success, .modal-footer button.btn-success'));
 
               if (acceptBtns.length === 0) {
-                // Alternatif: Tüm success butonları
+                // Alternative: all success buttons
                 acceptBtns = await driver.findElements(By.css('.btn-success, button.btn-success'));
               }
 
-              // Accept butonuna tıkla
+              // Click the Accept button
               let acceptClicked = false;
               for (const btn of acceptBtns) {
                 try {
@@ -640,7 +492,7 @@ async function main() {
         console.log(MSG.CAPTCHA_PREMIUM_SOLVED);
       } catch (e) {
         console.log(MSG.CAPTCHA_PREMIUM_FAILED(e.message));
-        throw new Error("Premium captcha çözülemedi");
+        throw new Error("Could not solve premium captcha");
       }
     }
 
@@ -656,26 +508,20 @@ async function main() {
   }
 
   // ============================================================
-  // Tek bir şehir için tam tarama akışı (Normal + Premium)
+  // Full scan flow for a single city (Normal + Premium)
   // ============================================================
-  async function scanCity(driver, city, skipLocationSet = false) {
+  async function scanCity(driver, city) {
     console.log(MSG.CITY_SCAN_START(city.name));
 
-    // Başvuru sahibi konumunu bu şehre ayarla (zaten set ise atla)
-    if (!skipLocationSet) {
-      await setApplicantLocation(driver, city);
-    }
-    // BLS profili bu şehre işlendi; Book Now / form / captcha vb. hata verse bile sonraki çalışmada doğru şehirden devam edilsin
-    saveLastCity(city.name);
-
-    // Ana sayfaya geri dön
-    await driver.get(`https://turkey.blsspainglobal.com${CFG.BLS_HOME_URL}`);
+    // The applicant's jurisdiction is set by hand in the portal profile and is
+    // never touched by the bot - we go straight to Book Now after login.
+    await driver.get(`${CFG.BASE_URL}${CFG.BLS_HOME_URL}`);
     await driver.sleep(CFG.SLEEP.AFTER_LOGIN);
     await checkAndHandleUnavailable(driver);
 
-    // Her şehir için "Book Now" butonuna tıkla
+    // Click the "Book Now" button
     try {
-      // Sayfanın tam yüklenmesini bekle
+      // Wait for the page to fully load
       await driver.wait(
         until.elementLocated(By.css(`a[href="${CFG.BOOK_NOW_URL}"]`)),
         CFG.DROPDOWN.TIMEOUT
@@ -686,7 +532,7 @@ async function main() {
         By.css(`a[href="${CFG.BOOK_NOW_URL}"]`)
       );
 
-      // Scroll + JS click (element not interactable hatasını önler)
+      // Scroll + JS click (avoids the element-not-interactable error)
       await driver.executeScript("arguments[0].scrollIntoView({block: 'center'});", bookNowBtn);
       await driver.sleep(CFG.SLEEP.SHORT);
 
@@ -698,7 +544,7 @@ async function main() {
       console.log(MSG.BOOK_NOW_CLICKED);
     } catch (e) {
       console.log(MSG.BOOK_NOW_NOT_FOUND(e.message));
-      throw new Error('"Book Now" butonuna tıklanamadı!');
+      throw new Error('Could not click the "Book Now" button!');
     }
 
     await driver.sleep(750);
@@ -710,7 +556,7 @@ async function main() {
     const cityCurrentUrl = await driver.getCurrentUrl();
     console.log(MSG.CURRENT_URL(cityCurrentUrl));
 
-    if (cityCurrentUrl.includes(CFG.VISA_TYPE_URL)) {
+    if (urlIsForm(cityCurrentUrl)) {
       console.log(MSG.FORM_DIRECT);
     } else {
       const cityPageSource = await driver.getPageSource();
@@ -753,7 +599,7 @@ async function main() {
             await driver.sleep(750);
 
             try {
-              await driver.wait(until.urlContains(CFG.VISA_TYPE_URL), 10000);
+              await driver.wait(async () => urlIsForm(await driver.getCurrentUrl()), 10000);
               console.log(MSG.APPOINTMENT_CAPTCHA_SUCCESS);
               appointmentCaptchaSuccess = true;
             } catch (e) {
@@ -762,7 +608,7 @@ async function main() {
                 console.log(MSG.APPOINTMENT_CAPTCHA_ALT_SUCCESS);
                 appointmentCaptchaSuccess = true;
               } else {
-                throw new Error("Form sayfasına yönlendirilmedi");
+                throw new Error("Was not redirected to the form page");
               }
             }
 
@@ -772,7 +618,7 @@ async function main() {
 
             if (appointmentRetries >= maxAppointmentRetries) {
               console.log(MSG.APPOINTMENT_MAX_RETRY(maxAppointmentRetries));
-              throw new Error("Randevu captcha başarısız - maksimum deneme sayısı aşıldı");
+              throw new Error("Appointment captcha failed - max attempts exceeded");
             }
 
             await driver.sleep(CFG.SLEEP.AFTER_LOGIN);
@@ -796,39 +642,36 @@ async function main() {
     await driver.sleep(CFG.SLEEP.MEDIUM);
 
     const formSuccess = {
-      jurisdiction: false,
       location: false,
       visaType: false,
       visaSubType: false,
       category: false
     };
 
-    formSuccess.jurisdiction = await selectKendoDropdownByLabel(driver, "Jurisdiction", city.JURISDICTION);
-    if (!formSuccess.jurisdiction) {
-      console.log(MSG.JURISDICTION_FAILED);
-      throw new Error(`Form doldurma başarısız: Jurisdiction (${city.name})`);
-    }
-    await driver.sleep(CFG.SLEEP.SHORT);
-
+    // No Jurisdiction dropdown on the Pakistan portal - the form starts at
+    // Location. Jurisdiction is a Turkey-only field.
     formSuccess.location = await selectKendoDropdownByLabel(driver, "Location", city.LOCATION);
     if (!formSuccess.location) {
       console.log(MSG.LOCATION_FAILED);
-      throw new Error(`Form doldurma başarısız: Location (${city.name})`);
+      throw new Error(`Form filling failed: Location (${city.name})`);
     }
+    await dismissVisibleModal(driver, "Location");
     await driver.sleep(CFG.SLEEP.SHORT);
 
     formSuccess.visaType = await selectKendoDropdownByLabel(driver, "Visa Type", CFG.FORM.VISA_TYPE);
     if (!formSuccess.visaType) {
       console.log(MSG.VISA_TYPE_FAILED);
-      throw new Error(`Form doldurma başarısız: Visa Type (${city.name})`);
+      throw new Error(`Form filling failed: Visa Type (${city.name})`);
     }
+    await dismissVisibleModal(driver, "Visa Type");
     await driver.sleep(CFG.SLEEP.SHORT);
 
     formSuccess.visaSubType = await selectKendoDropdownByLabel(driver, "Visa Sub Type", CFG.FORM.VISA_SUB_TYPE);
     if (!formSuccess.visaSubType) {
       console.log(MSG.VISA_SUB_TYPE_FAILED);
-      throw new Error(`Form doldurma başarısız: Visa Sub Type (${city.name})`);
+      throw new Error(`Form filling failed: Visa Sub Type (${city.name})`);
     }
+    await dismissVisibleModal(driver, "Visa Sub Type");
     await driver.sleep(CFG.SLEEP.SHORT);
 
     console.log(MSG.APPOINTMENT_FOR_INFO);
@@ -836,8 +679,9 @@ async function main() {
     formSuccess.category = await selectKendoDropdownByLabel(driver, "Category", CFG.FORM.CATEGORY_NORMAL);
     if (!formSuccess.category) {
       console.log(MSG.CATEGORY_FAILED);
-      throw new Error(`Form doldurma başarısız: Category (${city.name})`);
+      throw new Error(`Form filling failed: Category (${city.name})`);
     }
+    await dismissVisibleModal(driver, "Category");
     await driver.sleep(CFG.SLEEP.SHORT);
 
     console.log(MSG.FORM_ALL_DONE);
@@ -878,7 +722,7 @@ async function main() {
         console.log(MSG.CAPTCHA_SOLVED);
       } catch (e) {
         console.log(MSG.CAPTCHA_FAILED(e.message));
-        throw new Error("Captcha çözülemedi");
+        throw new Error("Could not solve captcha");
       }
     }
 
@@ -899,31 +743,31 @@ async function main() {
 
     console.log(MSG.CITY_SCAN_DONE(city.name));
 
-    // Bir sonraki şehir için ana sayfaya dön
-    await driver.get(`https://turkey.blsspainglobal.com${CFG.BLS_HOME_URL}`);
+    // Return to the home page for the next city
+    await driver.get(`${CFG.BASE_URL}${CFG.BLS_HOME_URL}`);
     await driver.sleep(CFG.SLEEP.AFTER_LOGIN);
     await checkAndHandleUnavailable(driver);
   }
 
-  // Slot açık mı kontrol fonksiyonu - SADELEŞTİRİLMİŞ
-  // NOT: Bu fonksiyon çağrılmadan ÖNCE captcha kontrolü yapılmalı!
+  // Slot-open check function - SIMPLIFIED
+  // NOTE: the captcha check must run BEFORE this function is called!
   async function checkIfSlotsAreOpen(driver, categoryName) {
     await driver.sleep(1000);
     await checkAndHandleUnavailable(driver);
 
     const pageSource = await driver.getPageSource();
 
-    // "Appointment Slot" label'ı var mı kontrol et - BU EN ÖNEMLİ KONTROL!
+    // Check for the "Appointment Slot" label - THIS IS THE MOST IMPORTANT CHECK!
     const hasAppointmentSlotLabel = pageSource.includes('Appointment Slot');
 
     if (hasAppointmentSlotLabel) {
       console.log(MSG.SLOT_OPEN(categoryName));
 
       try {
-        const message = `🎉 *${categoryName} Category'de Slotlar Açıldı!*\n\n` +
-          `✅ "Appointment Slot" label'ı tespit edildi\n` +
-          `📅 Randevu seçimi yapılabilir!\n\n` +
-          `🔗 [Hemen Kontrol Et!](${CFG.TELEGRAM.SLOT_OPEN_LINK})\n\n` +
+        const message = `🎉 *${categoryName} Category: slots are open!*\n\n` +
+          `✅ "Appointment Slot" label detected\n` +
+          `📅 An appointment can be selected!\n\n` +
+          `🔗 [Check it now!](${CFG.TELEGRAM.SLOT_OPEN_LINK})\n\n` +
           `⏰ ${new Date().toLocaleString('tr-TR')}`;
 
         const { sendMessageToTelegram } = require("./telegramNotifier");
@@ -940,9 +784,9 @@ async function main() {
     return false;
   }
 
-  // Slot tarama ve bildirim fonksiyonu (kod tekrarını önlemek için)
+  // Slot scanning and notification function (avoids duplicated code)
   async function scanAndNotifySlots(driver, categoryName = "Normal") {
-    // Date picker'ı bul
+    // Find the date picker
     const allDatePickers = await driver.findElements(By.css('input.k-input[data-role="datepicker"]'));
 
     let visibleDatePicker = null;
@@ -961,11 +805,11 @@ async function main() {
       console.log(MSG.DATE_PICKER_NOT_FOUND);
       console.log(MSG.SLOT_NO_DATE_PICKER(categoryName));
       try {
-        await notifySlotPageReached(`${categoryName}: Date picker bulunamadı ama slot sayfası açık!`);
+        await notifySlotPageReached(`${categoryName}: date picker not found, but the slot page is open!`);
       } catch (e) {
         console.log(MSG.TELEGRAM_FAILED_SIMPLE);
       }
-      throw new Error("Date picker bulunamadı");
+      throw new Error("Date picker not found");
     }
 
     console.log(MSG.CALENDAR_OPENING);
@@ -1012,7 +856,7 @@ async function main() {
           break;
         }
       } catch (e) {
-        /* takvim açma yöntemi sessizce atlanır */
+        /* this calendar-opening method is skipped silently */
       }
     }
 
@@ -1020,9 +864,9 @@ async function main() {
       console.log(MSG.CALENDAR_NOT_OPENED);
       console.log(MSG.SLOT_NO_CALENDAR(categoryName));
       try {
-        await notifySlotPageReached(`${categoryName}: Takvim açılamadı ama slot sayfası açık!`);
+        await notifySlotPageReached(`${categoryName}: could not open the calendar, but the slot page is open!`);
       } catch (e) { console.log(MSG.TELEGRAM_FAILED_SIMPLE); }
-      throw new Error("Takvim açılamadı");
+      throw new Error("Could not open the calendar");
     }
 
     await driver.sleep(CFG.SLEEP.LONG);
@@ -1031,9 +875,9 @@ async function main() {
     if (calendarExists.length === 0) {
       console.log(MSG.CALENDAR_ELEM_NOT_FOUND);
       try {
-        await notifySlotPageReached(`${categoryName}: Takvim elementi yok ama slot sayfası açık!`);
+        await notifySlotPageReached(`${categoryName}: no calendar element, but the slot page is open!`);
       } catch (e) { console.log(MSG.TELEGRAM_FAILED_SIMPLE); }
-      throw new Error("Takvim elementi yok");
+      throw new Error("No calendar element");
     }
 
     console.log(MSG.CALENDAR_ELEM_FOUND(calendarExists.length));
@@ -1079,7 +923,7 @@ async function main() {
             const tdClass = await parentTd.getAttribute('class');
             if (tdClass && tdClass.includes('k-state-disabled')) continue;
 
-            // Yeşil kontrol
+            // Green (available) check
             const colorInfo = await driver.executeScript(`
               const link = arguments[0];
               const style = window.getComputedStyle(link);
@@ -1124,7 +968,7 @@ async function main() {
           console.log(MSG.CALENDAR_MONTH_EMPTY(currentMonth));
         }
 
-        // Sonraki aya geç
+        // Move to the next month
         if (monthIndex < maxMonthsToCheck - 1) {
           try {
             const nextMonthBtns = await driver.findElements(By.css('.k-calendar .k-nav-next'));
@@ -1213,7 +1057,7 @@ async function main() {
         }
       } catch (e) { }
 
-      if (!emailInput) throw new Error("Email alanı bulunamadı!");
+      if (!emailInput) throw new Error("Email field not found!");
 
       try {
         console.log(MSG.EMAIL_ENTERING);
@@ -1249,7 +1093,7 @@ async function main() {
         }
       } catch (e) { }
 
-      if (!passwordInput) throw new Error("Password alanı bulunamadı!");
+      if (!passwordInput) throw new Error("Password field not found!");
 
       try {
         console.log(MSG.PASSWORD_ENTERING);
@@ -1263,7 +1107,7 @@ async function main() {
 
       await driver.sleep(1000);
 
-      // Login captcha'yı çöz - retry mekanizması ile
+      // Solve the login captcha - with a retry mechanism
       let loginSuccess = false;
       let loginRetries = 0;
       const maxLoginRetries = CFG.RETRY.MAX_LOGIN_RETRIES;
@@ -1280,12 +1124,12 @@ async function main() {
             const retryPasswords = await driver.findElements(By.css('input[type="password"]'));
             for (let passInput of retryPasswords) {
               try {
-                // Görünürlük kontrolü - bazı inputlar hidden olabilir
+                // Visibility check - some inputs may be hidden
                 let passDisplayed = false;
                 try {
                   passDisplayed = await passInput.isDisplayed();
                 } catch (e) {
-                  // isDisplayed hata verirse, JS ile kontrol et
+                  // If isDisplayed throws, check via JS instead
                   passDisplayed = await driver.executeScript(`
                     const el = arguments[0];
                     const style = window.getComputedStyle(el);
@@ -1308,18 +1152,18 @@ async function main() {
                     await driver.sleep(150);
                   }
 
-                  // Password değerini kontrol et ve doldur
+                  // Check and fill the password value
                   const currentValue = await passInput.getAttribute('value');
                   if (!currentValue || currentValue.length === 0) {
-                    // Önce JS ile temizle, sonra doldur
+                    // Clear via JS first, then fill
                     await driver.executeScript("arguments[0].value = '';", passInput);
                     await driver.executeScript("arguments[0].focus();", passInput);
                     await driver.sleep(100);
 
-                    // sendKeys ile gir
+                    // Enter via sendKeys
                     await passInput.sendKeys(PASSWORD);
 
-                    // Değer girildi mi kontrol et
+                    // Check whether the value was entered
                     const newValue = await passInput.getAttribute('value');
                     if (newValue && newValue.length > 0) {
                       console.log(MSG.PASSWORD_RETRY_SUCCESS);
@@ -1345,7 +1189,7 @@ async function main() {
             if (!passwordFound) {
               console.log(MSG.PASSWORD_NOT_FOUND);
 
-              // Email input bul ve doldur
+              // Find and fill the email input
               const retryEmailInputs = await driver.findElements(By.css('input[type="text"]'));
               for (let input of retryEmailInputs) {
                 try {
@@ -1447,7 +1291,7 @@ async function main() {
 
           if (loginRetries >= maxLoginRetries) {
             console.log(MSG.LOGIN_MAX_RETRY(maxLoginRetries));
-            throw new Error("Login başarısız - maksimum deneme sayısı aşıldı");
+            throw new Error("Login failed - max attempts exceeded");
           }
 
           await driver.sleep(CFG.SLEEP.AFTER_LOGIN);
@@ -1456,42 +1300,16 @@ async function main() {
 
       await driver.sleep(750);
 
-      // "Application Temporarily Unavailable" kontrolü
+      // "Application Temporarily Unavailable" check
       await checkAndHandleUnavailable(driver);
 
-      // Akıllı sıralama: son taranan şehrin bir sonrakinden başla
-      const orderedCities = getOrderedCities(CFG.CITIES);
-      const lastSavedCity = loadLastCity(); // getOrderedCities ile aynı okuma, tutarlı sonuç
-      console.log(MSG.CITY_ORDER_INFO(orderedCities.map(c => c.name)));
-
-      // Tüm şehirleri sırayla tara
-      for (let i = 0; i < orderedCities.length; i++) {
-        const city = orderedCities[i];
-        // İlk şehir lastCity ile aynıysa lokasyon BLS'de ZATEN set edilmiş — setApplicantLocation atla
-        const skipLocationSet = (i === 0) && (lastSavedCity === city.name);
-        if (skipLocationSet) {
-          console.log(`⚡ ${city.name} lokasyonu zaten set — ManageApplicant adımı atlanıyor.`);
-        }
-        try {
-          await scanCity(driver, city, skipLocationSet);
-        } catch (e) {
-          console.log(MSG.CITY_SCAN_ERROR(city.name, e.message));
-          // Bir şehirde hata olsa da sonrakine geç; ana sayfaya dön
-          try {
-            await driver.get(`https://turkey.blsspainglobal.com${CFG.BLS_HOME_URL}`);
-            await driver.sleep(CFG.SLEEP.AFTER_LOGIN);
-            await checkAndHandleUnavailable(driver);
-          } catch (_) { }
-        }
-
-        // Şehirler arası 10 saniyelik bekleme (son şehirden sonra gerekmez)
-        if (i < orderedCities.length - 1) {
-          console.log(`⏳ Sonraki şehre geçmeden önce 10 saniye bekleniyor...`);
-          await driver.sleep(10000);
-        }
+      // Single city. CFG.CITY must match the jurisdiction already set on the
+      // account - the bot does not change the applicant profile.
+      try {
+        await scanCity(driver, CFG.CITY);
+      } catch (e) {
+        console.log(MSG.CITY_SCAN_ERROR(CFG.CITY.name, e.message));
       }
-
-      console.log(MSG.ALL_CITIES_DONE);
 
     } catch (e) {
       console.error(MSG.GLOBAL_ERROR(e.message));
@@ -1501,6 +1319,6 @@ async function main() {
   })();
 }
 
-// app.js artık sadece main() fonksiyonunu çalıştırıyor
-// Döngü için main.js kullanılmalı!
+// app.js now only runs the main() function
+// Use main.js for the loop!
 main();
