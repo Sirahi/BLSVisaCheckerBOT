@@ -6,15 +6,34 @@ const { STATES, detect } = require('../pageState');
 
 test.after(async () => { await quitDriver(); });
 
-// GATE: if this fails, computed visibility does not survive file:// and the
-// rest of the offline suite cannot be trusted. Stop and re-plan.
-test('visibility survives file:// - only 1 of 40 box-labels is visible', async () => {
-  await withFixture('Book_New_Appointment_Captcha', async (d) => {
-    const all = await d.findElements(By.css('div.box-label'));
-    assert.ok(all.length > 30, `expected many decoys, got ${all.length}`);
+// GATE: computed visibility must work for ORDINARY elements over file://.
+// Captcha box-labels are deliberately excluded - they are camouflaged by
+// colour, not hidden, and all 39 report visible. See the spec.
+test('computed visibility survives file:// for ordinary elements', async () => {
+  await withFixture('Book_New_Appointment_Visa_Type_Selection', async (d) => {
+    const modals = await d.findElements(By.css('.modal'));
+    assert.ok(modals.length >= 7, `expected pre-rendered modals, got ${modals.length}`);
     let shown = 0;
-    for (const el of all) { try { if (await el.isDisplayed()) shown++; } catch (e) {} }
-    assert.strictEqual(shown, 1, `expected exactly 1 visible box-label, got ${shown}`);
+    for (const el of modals) { try { if (await el.isDisplayed()) shown++; } catch (e) {} }
+    assert.ok(shown < modals.length,
+      `CSS did not apply over file:// - all ${modals.length} modals report visible`);
+  });
+});
+
+// The decoys are painted the background colour. isDisplayed() is useless here;
+// the real label is the only one with a colour the others do not share.
+test('exactly one box-label is the odd colour out', async () => {
+  await withFixture('Book_New_Appointment_Captcha', async (d) => {
+    const counts = await d.executeScript(`
+      const c = {};
+      document.querySelectorAll('.box-label').forEach((e) => {
+        const k = getComputedStyle(e).color; c[k] = (c[k] || 0) + 1;
+      });
+      return c;
+    `);
+    const unique = Object.entries(counts).filter(([, n]) => n === 1);
+    assert.strictEqual(unique.length, 1,
+      `expected 1 odd-colour-out label, got ${unique.length}: ${JSON.stringify(counts)}`);
   });
 });
 
