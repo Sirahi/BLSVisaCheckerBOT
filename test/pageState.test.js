@@ -136,3 +136,32 @@ test('a visible datepicker is SLOTS', async () => {
   const r = await detect(d, 'https://appointment.thespainvisa.com/Global/Appointment/VisaType');
   assert.strictEqual(r.state, STATES.SLOTS);
 });
+
+test('the login page is LOGIN_EMAIL', async () => {
+  await withFixture('LoginPage', async (d) => {
+    const r = await detect(d, fixtureUrl('LoginPage'));
+    assert.strictEqual(r.state, STATES.LOGIN_EMAIL);
+  });
+});
+
+test('the Book Now page is HOME', async () => {
+  await withFixture('Book_Now_Button_Page', async (d) => {
+    const r = await detect(d, fixtureUrl('Book_Now_Button_Page'));
+    assert.strictEqual(r.state, STATES.HOME);
+  });
+});
+
+// The nav bar carries the same href on every page. HOME must not match here.
+test('the form page is not HOME even though the nav has the Book Now href', async () => {
+  await withFixture('Book_New_Appointment_Visa_Type_Selection', async (d) => {
+    const r = await detect(d, fixtureUrl('Book_New_Appointment_Visa_Type_Selection'));
+    assert.strictEqual(r.state, STATES.VISA_FORM);
+  });
+});
+
+test('the captcha page is not HOME even though the nav has the Book Now href', async () => {
+  await withFixture('Captcha', async (d) => {
+    const r = await detect(d, fixtureUrl('Captcha'));
+    assert.strictEqual(r.state, STATES.CAPTCHA);
+  });
+});

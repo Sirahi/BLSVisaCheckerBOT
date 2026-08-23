@@ -161,8 +161,38 @@ async function visaForm(driver, url) {
   return { state: STATES.VISA_FORM, reason: null, evidence: hit };
 }
 
+// #btnVerify is in the shared layout on EVERY page, so it only means anything
+// combined with the url and a visibility check.
+async function loginEmail(driver, url) {
+  if (!/\/account\/login/i.test(url)) return null;
+  const ok = await driver.executeScript(`
+    ${VIS_FN}
+    const verify = document.querySelector('#btnVerify');
+    if (!verify || !vis(verify)) return null;
+    const input = [...document.querySelectorAll('input[type="text"], input[type="email"]')]
+      .find((e) => vis(e) && e.getBoundingClientRect().width > 50);
+    return input ? 'email input + btnVerify' : null;
+  `);
+  if (!ok) return null;
+  return { state: STATES.LOGIN_EMAIL, reason: null, evidence: ok };
+}
+
+// The Book Now href is in the nav on every page. Exclude .nav-link and pin the
+// url, or this matches almost everywhere.
+async function home(driver, url) {
+  if (!/\/home\/index/i.test(url)) return null;
+  const ok = await driver.executeScript(`
+    ${VIS_FN}
+    const links = [...document.querySelectorAll('a[href$="appointment/newappointment"]')];
+    const real = links.find((a) => !a.classList.contains('nav-link') && vis(a));
+    return real ? real.getAttribute('href') : null;
+  `);
+  if (!ok) return null;
+  return { state: STATES.HOME, reason: null, evidence: ok };
+}
+
 // Ordered. First match wins. Order is load-bearing - see the spec.
-const PREDICATES = [deadEnd, loginCaptcha, captcha, slots, visaForm];
+const PREDICATES = [deadEnd, loginCaptcha, captcha, slots, visaForm, loginEmail, home];
 
 /**
  * @param {import('selenium-webdriver').WebDriver} driver
