@@ -165,3 +165,13 @@ test('the captcha page is not HOME even though the nav has the Book Now href', a
     assert.strictEqual(r.state, STATES.CAPTCHA);
   });
 });
+
+test('an outage page is UNAVAILABLE', async () => {
+  const { getDriver } = require('./helpers');
+  const d = await getDriver();
+  await d.get('data:text/html,' + encodeURIComponent(
+    '<html><body><h1>Application Temporarily Unavailable</h1></body></html>'
+  ));
+  const r = await detect(d, 'https://appointment.thespainvisa.com/Global/home/index');
+  assert.strictEqual(r.state, STATES.UNAVAILABLE);
+});

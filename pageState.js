@@ -191,8 +191,30 @@ async function home(driver, url) {
   return { state: STATES.HOME, reason: null, evidence: ok };
 }
 
-// Ordered. First match wins. Order is load-bearing - see the spec.
-const PREDICATES = [deadEnd, loginCaptcha, captcha, slots, visaForm, loginEmail, home];
+// Source-based on purpose: the outage page is a bare error document with no
+// stable structure to resolve.
+async function unavailable(driver) {
+  const src = await driver.getPageSource();
+  if (!/Temporarily Unavailable/i.test(src)) return null;
+  return { state: STATES.UNAVAILABLE, reason: null, evidence: 'Temporarily Unavailable' };
+}
+
+// Ordered. First match wins.
+//
+// ORDER IS LOAD-BEARING:
+//  - deadEnd first: TryAgain's button href IS the Book Now selector.
+//  - loginCaptcha before captcha: a visible password field is the only diff.
+//  - slots before visaForm: a successful search EXTENDS the form page.
+const PREDICATES = [
+  unavailable,
+  deadEnd,
+  loginCaptcha,
+  captcha,
+  slots,
+  visaForm,
+  loginEmail,
+  home,
+];
 
 /**
  * @param {import('selenium-webdriver').WebDriver} driver
