@@ -5,7 +5,8 @@
   "main": "main.js",
   "scripts": {
     "start": "node main.js",
-    "once": "node app.js"
+    "once": "node app.js",
+    "test": "node --test test/*.test.js"
   },
   "author": "",
   "license": "ISC",
