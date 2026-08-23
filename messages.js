@@ -171,4 +171,11 @@ module.exports = {
 
     // === GENERAL ERROR ===
     GLOBAL_ERROR: (msg) => `❌ An error occurred: ${msg}`,
+
+    // === STATE MACHINE ===
+    MACHINE_START: 'State machine starting.',
+    MACHINE_DONE: (result, transitions, searches) =>
+        `Run finished: ${result} after ${transitions} transitions. Searches used (all time): ${searches}.`,
+    MACHINE_RESULTS: (results) =>
+        `Category results: ${Object.entries(results).map(([k, v]) => `${k}=${v}`).join(', ') || '(none)'}`,
 };
