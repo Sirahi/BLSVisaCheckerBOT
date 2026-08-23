@@ -218,183 +218,6 @@ async function runOCRWithVoting(imgBuffer, boxIndex) {
 }
 
 // ============================================
-// MAIN FUNCTION: captcha solving
-// ============================================
-async function solveCaptchaInIframe(driver, retryCount = 0, maxRetries = 3, isLoginCaptcha = false) {
-  try {
-    if (retryCount === 0) {
-      resetOCRStats();
-    }
-
-    // Rate limiting check
-    try {
-      const rateLimitElems = await driver.findElements(By.xpath("//*[contains(text(), 'maximum number of captcha request') or contains(text(), 'Please try after sometime')]"));
-      if (rateLimitElems.length > 0) {
-        console.log('😤 Rate limited! Backing off... 30 second break ☕');
-        await driver.sleep(30000);
-        await driver.navigate().refresh();
-        await driver.sleep(5000);
-        if (retryCount < maxRetries) {
-          return await solveCaptchaInIframe(driver, retryCount + 1, maxRetries, isLoginCaptcha);
-        }
-        return;
-      }
-    } catch (e) { }
-
-    // Find the target number
-    const targetNumber = await findTargetNumber(driver);
-
-    // Select the tiles
-    await selectCaptchaBoxes(driver, targetNumber, isLoginCaptcha ? 'login' : 'entry');
-
-    const successRate = calculateOCRSuccessRate();
-    // Very low success rate check
-    if (successRate < 20 && ocrStats.targetMatches === 0 && ocrStats.totalAttempts > 50) {
-      console.log('⚠️ OCR success rate too low, aborting this captcha...');
-      await driver.switchTo().defaultContent();
-      return;
-    }
-
-    await driver.sleep(2000);
-    await driver.switchTo().defaultContent();
-
-    // Alert check
-    let alertPresent = false;
-    try {
-      while (true) {
-        await driver.wait(until.alertIsPresent(), 1000);
-        const alert = await driver.switchTo().alert();
-        const alertText = await alert.getText();
-        console.log('⚠️ Alert:', alertText);
-
-        if (alertText.includes('maximum number of captcha request') || alertText.includes('Please try after sometime')) {
-          await alert.accept();
-          await driver.sleep(30000);
-          await driver.navigate().refresh();
-          await driver.sleep(5000);
-          if (retryCount < maxRetries) {
-            return await solveCaptchaInIframe(driver, retryCount + 1, maxRetries, isLoginCaptcha);
-          }
-          return;
-        }
-
-        alertPresent = true;
-        await alert.accept();
-        await driver.sleep(500);
-      }
-    } catch (e) { }
-
-    if (alertPresent && retryCount < maxRetries) {
-      console.log(`🔄 Captcha tekrar deneniyor (alert) (${retryCount + 1}/${maxRetries})`);
-      await driver.sleep(2000 + Math.random() * 2000);
-      return await solveCaptchaInIframe(driver, retryCount + 1, maxRetries, isLoginCaptcha);
-    }
-
-    // Invalid captcha check
-    let invalid = false;
-    try {
-      // 'Geçersiz' is Turkish for 'invalid' - kept because it matches the
-      // PORTAL's own error text on the Turkish deployment, not our output.
-      // Harmless on the English Pakistan portal; costs nothing to leave in.
-      const errorElems = await driver.findElements(By.xpath("//*[contains(text(), 'Invalid captcha') or contains(text(), 'invalid captcha') or contains(text(), 'Geçersiz')]"));
-      if (errorElems.length > 0) {
-        invalid = true;
-        console.log('❌ Invalid captcha message found!');
-      }
-
-      const modalOpen1 = await driver.findElements(By.css('iframe[title="Verify Selection"]'));
-      const modalOpen2 = await driver.findElements(By.css('iframe[title="Verify Registration"]'));
-      if ((modalOpen1.length > 0 || modalOpen2.length > 0) && !invalid) {
-        invalid = true;
-        console.log('❌ CAPTCHA modal is still open!');
-      }
-    } catch (e) { }
-
-    if (invalid) {
-      // For the login captcha, rethrow to the caller (for the password check)
-      // Other captchas handle their own retry
-      if (isLoginCaptcha) {
-        console.log('⚠️ Invalid login captcha - will retry at the caller (for the password check)');
-        throw new Error('Invalid captcha - password check required');
-      } else if (retryCount < maxRetries) {
-        console.log(`🔄 Retrying captcha (${retryCount + 1}/${maxRetries})...`);
-        await driver.sleep(3000 + Math.random() * 3000);
-        return await solveCaptchaInIframe(driver, retryCount + 1, maxRetries, isLoginCaptcha);
-      } else {
-        console.log('😢 Max attempts exceeded, captcha not solved this time...');
-      }
-    } else {
-      await driver.sleep(500);
-
-      // Clear any remaining alerts
-      try {
-        while (true) {
-          await driver.wait(until.alertIsPresent(), 1000);
-          const alert = await driver.switchTo().alert();
-          await alert.accept();
-          await driver.sleep(500);
-        }
-      } catch (e) { }
-
-      // DO NOT click #btnSubmit here.
-      //
-      // On the Pakistan portal, solving the entry captcha lands on the Visa
-      // Type Selection form, whose Submit button is also #btnSubmit. Clicking
-      // it here submitted the form EMPTY - producing "Please select appointment
-      // category", burning an appointment attempt, and breaking the Premium
-      // flow (the empty submit navigated away, so the redirect check failed and
-      // every retry then found no captcha).
-      //
-      // Submitting the form is app.js's job, after the dropdowns are filled.
-    }
-  } catch (e) {
-    console.log(`❌ Captcha error: ${e.message}`);
-
-    // Alert temizle
-    try {
-      while (true) {
-        await driver.wait(until.alertIsPresent(), 1000);
-        const alert = await driver.switchTo().alert();
-        const alertText = await alert.getText();
-
-        if (alertText.includes('maximum number of captcha request')) {
-          await alert.accept();
-          console.log('😤 Rate limited! Throwing so the caller can retry...');
-          throw new Error('Rate limiting - page refresh required');
-        }
-
-        await alert.accept();
-        await driver.sleep(500);
-      }
-    } catch (e2) {
-      // e2 may be the error we threw - rethrow it
-      if (e2.message && e2.message.includes('Rate limiting')) {
-        throw e2;
-      }
-    }
-
-    // Login-captcha-specific errors - rethrow straight to the caller (for the password check)
-    if (e.message && (
-      e.message.includes('password check required') ||
-      e.message.includes('Target number not found')
-    )) {
-      if (isLoginCaptcha) {
-        console.log('🔄 Propagating the error to the caller (for the password check)...');
-        throw e;
-      }
-    }
-
-    // Retry for other errors
-    if (retryCount < maxRetries) {
-      console.log(`🔄 Tekrar deneniyor... (${retryCount + 1}/${maxRetries})`);
-      return await solveCaptchaInIframe(driver, retryCount + 1, maxRetries, isLoginCaptcha);
-    } else {
-      throw e; // Max attempts exceeded - propagate the error
-    }
-  }
-}
-
-// ============================================
 // Find the target number
 // ============================================
 async function findTargetNumber(driver) {
@@ -621,11 +444,53 @@ async function selectCaptchaBoxes(driver, targetNumber, kind = 'captcha') {
   if (isInIframe) await driver.switchTo().defaultContent();
 }
 
+// ============================================
+// MAIN ENTRY POINT: single-shot captcha solving
+// ============================================
+/**
+ * Solve the captcha that is ON SCREEN RIGHT NOW. Exactly one attempt.
+ *
+ * No retries, no refreshes, no navigation, no #btnSubmit click. The state
+ * machine owns all of that - it can see the page, this function cannot.
+ * Returns a result object instead of throwing for ordinary failure.
+ */
+async function solveVisibleCaptcha(driver, { isLogin = false } = {}) {
+  resetOCRStats();
+  try {
+    const target = await findTargetNumber(driver);
+    await selectCaptchaBoxes(driver, target, isLogin ? 'login' : 'entry');
+    await driver.switchTo().defaultContent();
+
+    // Accept any alert the portal raised, and report it - the caller decides.
+    let alertText = null;
+    try {
+      while (true) {
+        await driver.wait(until.alertIsPresent(), 800);
+        const alert = await driver.switchTo().alert();
+        alertText = await alert.getText();
+        await alert.accept();
+        await driver.sleep(300);
+      }
+    } catch (e) { /* no more alerts */ }
+
+    if (alertText && /maximum number of captcha request|Please try after sometime/i.test(alertText)) {
+      return { ok: false, target, clicked: 0, reason: 'RATE_LIMITED' };
+    }
+    if (alertText) {
+      return { ok: false, target, clicked: 0, reason: `ALERT: ${alertText}` };
+    }
+    return { ok: true, target, clicked: 0, reason: null };
+  } catch (e) {
+    try { await driver.switchTo().defaultContent(); } catch (e2) { /* ignore */ }
+    return { ok: false, target: null, clicked: 0, reason: e.message };
+  }
+}
+
 module.exports = {
   // exported so ../captcha-lab can benchmark the real pipeline offline
   preprocessAdaptive,
   otsuThreshold,
-  solveCaptchaInIframe,
+  solveVisibleCaptcha,
   findTargetNumber,
   selectCaptchaBoxes,
   calculateOCRSuccessRate,
