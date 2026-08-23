@@ -102,3 +102,37 @@ test('CAPTCHA evidence carries the target number', async () => {
     assert.match(r.evidence, /\d{3}/);
   });
 });
+
+for (const name of [
+  'Book_New_Appointment_Visa_Type_Selection',
+  'Book_New_Appointment_Visa_Type_Selection_National_Visa_Type_Popup',
+  'Book_New_Appointment_Visa_Type_Selection_Premium_Category_Popup',
+]) {
+  test(`${name} is VISA_FORM`, async () => {
+    await withFixture(name, async (d) => {
+      const r = await detect(d, fixtureUrl(name));
+      assert.strictEqual(r.state, STATES.VISA_FORM);
+    });
+  });
+}
+
+// No SLOTS capture exists, so assert the guarantee that matters: the form page
+// must never be claimed by the SLOTS predicate, which is checked first.
+test('SLOTS does not steal the form page', async () => {
+  await withFixture('Book_New_Appointment_Visa_Type_Selection', async (d) => {
+    const r = await detect(d, fixtureUrl('Book_New_Appointment_Visa_Type_Selection'));
+    assert.notStrictEqual(r.state, STATES.SLOTS);
+  });
+});
+
+// Synthetic: a datepicker is enough to mean SLOTS.
+test('a visible datepicker is SLOTS', async () => {
+  const { getDriver } = require('./helpers');
+  const d = await getDriver();
+  await d.get('data:text/html,' + encodeURIComponent(
+    '<html><body><input class="k-input" data-role="datepicker" ' +
+    'style="width:200px;height:30px"></body></html>'
+  ));
+  const r = await detect(d, 'https://appointment.thespainvisa.com/Global/Appointment/VisaType');
+  assert.strictEqual(r.state, STATES.SLOTS);
+});

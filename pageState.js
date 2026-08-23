@@ -130,8 +130,39 @@ async function captcha(driver) {
   return { state: STATES.CAPTCHA, reason: null, evidence: label };
 }
 
+// Deliberately loose. A missed slot notification is this project's worst
+// outcome, so the source-text fallback is kept alongside the element check.
+// This is the ONE permitted getPageSource-style test in the detector.
+async function slots(driver) {
+  const hit = await driver.executeScript(`
+    ${VIS_FN}
+    if ([...document.querySelectorAll('input[data-role="datepicker"]')].some(vis)) {
+      return 'datepicker';
+    }
+    const labels = [...document.querySelectorAll('label, span, div, h5')];
+    const el = labels.find((e) => vis(e) && /Appointment Slot/i.test(e.textContent));
+    return el ? 'Appointment Slot label' : null;
+  `);
+  if (!hit) return null;
+  return { state: STATES.SLOTS, reason: null, evidence: hit };
+}
+
+async function visaForm(driver, url) {
+  const hit = await driver.executeScript(`
+    ${VIS_FN}
+    const dd = [...document.querySelectorAll('span.k-dropdown-wrap')].filter(vis);
+    if (dd.length === 0) return null;
+    const h5 = [...document.querySelectorAll('h5')].find(
+      (e) => /Visa Type Selection/i.test(e.textContent)
+    );
+    return h5 ? dd.length + ' dropdowns, h5 matched' : null;
+  `);
+  if (!hit) return null;
+  return { state: STATES.VISA_FORM, reason: null, evidence: hit };
+}
+
 // Ordered. First match wins. Order is load-bearing - see the spec.
-const PREDICATES = [deadEnd, loginCaptcha, captcha];
+const PREDICATES = [deadEnd, loginCaptcha, captcha, slots, visaForm];
 
 /**
  * @param {import('selenium-webdriver').WebDriver} driver
