@@ -13,3 +13,6 @@ chromedriver.exe
 
 # Captcha debug images
 numbers_img/
+
+# Persisted search counter
+.search-count.json

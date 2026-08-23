@@ -50,6 +50,21 @@ module.exports = {
         MAX_UNAVAILABLE_RETRIES: 5,
     },
 
+    // === STATE MACHINE ===
+    MACHINE: {
+        MAX_TRANSITIONS: 40,
+        OSCILLATION_LIMIT: 6, // must exceed BUDGET.unavailable
+        SEARCH_FILE: require('path').join(__dirname, '.search-count.json'),
+        PLAN: ['Normal', 'Premium'],
+    },
+
+    BUDGET: {
+        login: 3,
+        preForm: 3,
+        postForm: 3,
+        unavailable: 5,
+    },
+
     // === SLEEP (ms) ===
     SLEEP: {
         SHORT: 250,
