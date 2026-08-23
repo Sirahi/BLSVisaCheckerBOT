@@ -74,3 +74,31 @@ test('the Visa Type form is NOT a dead end despite #div-main and an alert', asyn
     assert.notStrictEqual(r.state, STATES.DEAD_END);
   });
 });
+
+test('the login page with password + captcha is LOGIN_CAPTCHA', async () => {
+  await withFixture('LoginPage_Captcha_And_Password', async (d) => {
+    const r = await detect(d, fixtureUrl('LoginPage_Captcha_And_Password'));
+    assert.strictEqual(r.state, STATES.LOGIN_CAPTCHA);
+  });
+});
+
+test('the appointment captcha page is CAPTCHA', async () => {
+  await withFixture('Book_New_Appointment_Captcha', async (d) => {
+    const r = await detect(d, fixtureUrl('Book_New_Appointment_Captcha'));
+    assert.strictEqual(r.state, STATES.CAPTCHA);
+  });
+});
+
+test('the second captcha capture is also CAPTCHA', async () => {
+  await withFixture('Captcha', async (d) => {
+    const r = await detect(d, fixtureUrl('Captcha'));
+    assert.strictEqual(r.state, STATES.CAPTCHA);
+  });
+});
+
+test('CAPTCHA evidence carries the target number', async () => {
+  await withFixture('Book_New_Appointment_Captcha', async (d) => {
+    const r = await detect(d, fixtureUrl('Book_New_Appointment_Captcha'));
+    assert.match(r.evidence, /\d{3}/);
+  });
+});

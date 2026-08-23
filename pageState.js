@@ -100,8 +100,38 @@ async function deadEnd(driver) {
   return { state: STATES.DEAD_END, reason, evidence: info.text.slice(0, 300) };
 }
 
+// Returns the REAL box-label's text, or null. The decoys are painted the
+// background colour, never hidden, so vis() cannot be used here.
+async function visibleCaptchaLabel(driver) {
+  return driver.executeScript(`
+    ${CAPTCHA_LABEL_FN}
+    return captchaLabel();
+  `);
+}
+
+async function hasVisiblePassword(driver) {
+  return driver.executeScript(`
+    ${VIS_FN}
+    return [...document.querySelectorAll('input[type="password"]')].some(vis);
+  `);
+}
+
+// Ordered before captcha: a visible password field is the ONLY difference.
+async function loginCaptcha(driver) {
+  const label = await visibleCaptchaLabel(driver);
+  if (!label) return null;
+  if (!(await hasVisiblePassword(driver))) return null;
+  return { state: STATES.LOGIN_CAPTCHA, reason: null, evidence: label };
+}
+
+async function captcha(driver) {
+  const label = await visibleCaptchaLabel(driver);
+  if (!label) return null;
+  return { state: STATES.CAPTCHA, reason: null, evidence: label };
+}
+
 // Ordered. First match wins. Order is load-bearing - see the spec.
-const PREDICATES = [deadEnd];
+const PREDICATES = [deadEnd, loginCaptcha, captcha];
 
 /**
  * @param {import('selenium-webdriver').WebDriver} driver
