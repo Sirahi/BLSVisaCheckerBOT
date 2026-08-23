@@ -33,8 +33,9 @@ const REASONS = {
 // not). Tiebreak: highest z-index, which is what the shipping findTargetNumber
 // already uses. Verified agreeing on all three captures.
 //
-// NOTE: textContent drops every 's' - "Plea e  elect all boxe  with number
-// 696". Digits and "number" survive; never match on label words.
+// The resolved label's textContent is intact: "Please select all boxes with
+// number 696". (An earlier note here claimed every 's' was dropped - that was
+// an artifact of a /s+/ regex produced by heredoc escaping, not the portal.)
 const CAPTCHA_LABEL_FN = `
   const captchaLabel = () => {
     const els = [...document.querySelectorAll('.box-label')];
