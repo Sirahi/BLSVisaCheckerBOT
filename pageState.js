@@ -68,8 +68,40 @@ const VIS_FN = `
   };
 `;
 
+// The alert must be a DIRECT child of #div-main and must NOT sit inside a
+// modal. The Visa Type form has #div-main AND an alert-warning (inside
+// #scamAlert) AND six a.btn-primary - every conjunct of a naive predicate.
+async function deadEnd(driver) {
+  const info = await driver.executeScript(`
+    ${VIS_FN}
+    const dm = document.querySelector('#div-main');
+    if (!dm) return null;
+    if ([...document.querySelectorAll('.box-label')].some(vis)) return null;
+    const alert = [...dm.children].find(
+      (c) => c.classList.contains('alert') && !c.closest('.modal') && vis(c)
+    );
+    if (!alert) return null;
+    const btn = [...dm.querySelectorAll('a.btn-primary')].find(vis);
+    if (!btn) return null;
+    return {
+      cls: alert.className,
+      text: alert.textContent.replace(/\\s+/g, ' ').trim(),
+      href: btn.getAttribute('href'),
+    };
+  `);
+  if (!info) return null;
+
+  let reason = REASONS.UNKNOWN_REASON;
+  if (/alert-warning/.test(info.cls) && /captcha/i.test(info.text) && /invalid/i.test(info.text)) {
+    reason = REASONS.CAPTCHA_INVALID;
+  } else if (/alert-danger/.test(info.cls) && /no slots are available/i.test(info.text)) {
+    reason = REASONS.NO_SLOTS;
+  }
+  return { state: STATES.DEAD_END, reason, evidence: info.text.slice(0, 300) };
+}
+
 // Ordered. First match wins. Order is load-bearing - see the spec.
-const PREDICATES = [];
+const PREDICATES = [deadEnd];
 
 /**
  * @param {import('selenium-webdriver').WebDriver} driver

@@ -44,3 +44,33 @@ test('detect fails closed on a page it does not recognise', async () => {
   const r = await detect(d, 'https://example.com/');
   assert.strictEqual(r.state, STATES.UNKNOWN);
 });
+
+const { REASONS } = require('../pageState');
+const { fixtureUrl } = require('./fixtures');
+
+test('TryAgain is a dead end meaning NO_SLOTS', async () => {
+  await withFixture('TryAgain', async (d) => {
+    const r = await detect(d, fixtureUrl('TryAgain'));
+    assert.strictEqual(r.state, STATES.DEAD_END);
+    assert.strictEqual(r.reason, REASONS.NO_SLOTS);
+    assert.match(r.evidence, /no slots are available/i);
+  });
+});
+
+test('Go_To_Home is a dead end meaning CAPTCHA_INVALID', async () => {
+  await withFixture('Go_To_Home', async (d) => {
+    const r = await detect(d, fixtureUrl('Go_To_Home'));
+    assert.strictEqual(r.state, STATES.DEAD_END);
+    assert.strictEqual(r.reason, REASONS.CAPTCHA_INVALID);
+    assert.match(r.evidence, /captcha/i);
+  });
+});
+
+// The form page has #div-main + an alert-warning + 6 btn-primary. It must NOT
+// be mistaken for a dead end, because DEAD_END is checked first.
+test('the Visa Type form is NOT a dead end despite #div-main and an alert', async () => {
+  await withFixture('Book_New_Appointment_Visa_Type_Selection', async (d) => {
+    const r = await detect(d, fixtureUrl('Book_New_Appointment_Visa_Type_Selection'));
+    assert.notStrictEqual(r.state, STATES.DEAD_END);
+  });
+});
