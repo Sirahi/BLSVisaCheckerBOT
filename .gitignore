@@ -16,3 +16,4 @@ numbers_img/
 
 # Persisted search counter
 .search-count.json
+logs/

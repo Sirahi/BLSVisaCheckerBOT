@@ -12,6 +12,7 @@
  * searches are tracked separately rather than inferred.
  */
 const fs = require('fs');
+const path = require('path');
 
 function readSearches(file) {
   try {
@@ -22,8 +23,8 @@ function readSearches(file) {
   }
 }
 
-function createBudget({ limits, searchFile }) {
-  const counters = { login: 0, preForm: 0, postForm: 0, unavailable: 0 };
+function createBudget({ limits, searchFile, searchLog }) {
+  const counters = { login: 0, preForm: 0, postForm: 0, unavailable: 0, profile: 0 };
   let searchesUsed = readSearches(searchFile);
   let exhausted = null;
 
@@ -40,23 +41,37 @@ function createBudget({ limits, searchFile }) {
     },
 
     // A new category gets a full traversal allowance. login is NOT reset - we
-    // do not log in again mid-run.
+    // do not log in again mid-run. profile IS reset: crossing a city boundary
+    // means a fresh Manage Applicants subflow, which deserves its own budget.
     resetTraversal() {
       counters.preForm = 0;
       counters.postForm = 0;
       counters.unavailable = 0;
+      counters.profile = 0;
       exhausted = null;
     },
 
-    recordSearch() {
+    recordSearch(meta = {}) {
       searchesUsed += 1;
+      const at = new Date().toISOString();
       try {
         fs.writeFileSync(
           searchFile,
-          JSON.stringify({ searchesUsed, updatedAt: new Date().toISOString() }, null, 2)
+          JSON.stringify({ searchesUsed, updatedAt: at }, null, 2)
         );
       } catch (e) {
         // Never let bookkeeping kill a run.
+      }
+      // The all-time total above cannot express a RATE. The block is what we
+      // are pacing against and its window is still unknown, so every search
+      // gets a timestamp of its own.
+      if (searchLog) {
+        try {
+          fs.mkdirSync(path.dirname(searchLog), { recursive: true });
+          fs.appendFileSync(searchLog, JSON.stringify({ at, n: searchesUsed, ...meta }) + '\n');
+        } catch (e) {
+          // Never let bookkeeping kill a run.
+        }
       }
       return searchesUsed;
     },

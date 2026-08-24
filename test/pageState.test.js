@@ -175,3 +175,110 @@ test('an outage page is UNAVAILABLE', async () => {
   const r = await detect(d, 'https://appointment.thespainvisa.com/Global/home/index');
   assert.strictEqual(r.state, STATES.UNAVAILABLE);
 });
+
+const MYAPPTS_URL = 'https://appointment.thespainvisa.com/Global/appointmentdata/MyAppointments';
+
+async function onHtml(html, url) {
+  const { getDriver } = require('./helpers');
+  const d = await getDriver();
+  await d.get('data:text/html,' + encodeURIComponent(html));
+  return detect(d, url);
+}
+
+test('the applicant list is PROFILE_LIST', async () => {
+  const r = await onHtml(
+    `<div class="row border">Primary Applicant
+       <a href="#" onclick="ManageApplicant('x')">Edit</a>
+     </div>`, MYAPPTS_URL);
+  assert.strictEqual(r.state, STATES.PROFILE_LIST);
+});
+
+test('PROFILE_LIST needs the URL, not just the link', async () => {
+  const r = await onHtml(
+    `<a href="#" onclick="ManageApplicant('x')">Edit</a>`,
+    'https://appointment.thespainvisa.com/Global/home/index');
+  assert.notStrictEqual(r.state, STATES.PROFILE_LIST);
+});
+
+test('the location modal is PROFILE_FORM', async () => {
+  const r = await onHtml(
+    `<div class="modal-content">
+       <div class="modal-body"><label class="form-label">Location*</label></div>
+       <div class="modal-footer"><button onclick="VisaTypeProceed();">Proceed</button></div>
+     </div>`, MYAPPTS_URL);
+  assert.strictEqual(r.state, STATES.PROFILE_FORM);
+});
+
+test('a hidden modal is not PROFILE_FORM', async () => {
+  const r = await onHtml(
+    `<div class="modal-content" style="display:none">
+       <label class="form-label">Location*</label>
+       <button>Proceed</button>
+     </div>`, MYAPPTS_URL);
+  assert.notStrictEqual(r.state, STATES.PROFILE_FORM);
+});
+
+test('the kendo iframe is PROFILE_CONFIRM and beats the modal behind it', async () => {
+  const r = await onHtml(
+    `<div class="modal-content">
+       <label class="form-label">Location*</label><button>Proceed</button>
+     </div>
+     <iframe class="k-content-frame" style="width:400px;height:300px"></iframe>`, MYAPPTS_URL);
+  assert.strictEqual(r.state, STATES.PROFILE_CONFIRM);
+});
+
+test('a datepicker on MyAppointments does not masquerade as SLOTS', async () => {
+  const r = await onHtml(
+    `<div class="row border">Primary Applicant
+       <a href="#" onclick="ManageApplicant('x')">Edit</a>
+     </div>
+     <input data-role="datepicker" style="width:200px;height:30px">`, MYAPPTS_URL);
+  assert.strictEqual(r.state, STATES.PROFILE_LIST,
+    'profile predicates must be ordered ahead of the deliberately-loose slots predicate');
+});
+
+// ---- F6: slots must never fire on MyAppointments -------------------------
+//
+// profileList is URL-pinned AND requires a[onclick*="ManageApplicant"]. The
+// real page has never been captured; if it turns out to use
+// <button onclick="ManageApplicant..."> instead of <a>, profileList misses,
+// and the deliberately-loose slots predicate - any visible datepicker - fires
+// a FALSE slots alert on an appointments page. Waking a human at 3am for
+// nothing is this project's worst failure mode.
+const MY_APPTS = 'https://appointment.thespainvisa.com/Global/appointmentdata/MyAppointments';
+const NEW_APPT = 'https://appointment.thespainvisa.com/Global/appointment/newappointment';
+const DATEPICKER_PAGE =
+  'data:text/html,<html><body><input class="k-input" data-role="datepicker" ' +
+  'style="width:220px;height:32px"></body></html>';
+
+test('a datepicker on MyAppointments is NOT a slots page', async () => {
+  const { getDriver } = require('./helpers');
+  const d = await getDriver();
+  await d.get(DATEPICKER_PAGE);
+  const r = await detect(d, MY_APPTS);
+  assert.notStrictEqual(r.state, STATES.SLOTS,
+    'a MyAppointments datepicker must never fire the 3am alert');
+});
+
+// The guard cannot hide a real slot: the genuine slots page lives on
+// /appointment/newappointment, which the guard does not touch.
+test('the same datepicker on the booking url IS still a slots page', async () => {
+  const { getDriver } = require('./helpers');
+  const d = await getDriver();
+  await d.get(DATEPICKER_PAGE);
+  const r = await detect(d, NEW_APPT);
+  assert.strictEqual(r.state, STATES.SLOTS);
+});
+
+test('the guard does not stop MyAppointments being detected as PROFILE_LIST', async () => {
+  const { getDriver } = require('./helpers');
+  const d = await getDriver();
+  await d.get(
+    'data:text/html,<html><body>' +
+    '<a onclick="ManageApplicant(1)" style="display:block;width:80px;height:20px">Edit</a>' +
+    '<input class="k-input" data-role="datepicker" style="width:220px;height:32px">' +
+    '</body></html>'
+  );
+  const r = await detect(d, MY_APPTS);
+  assert.strictEqual(r.state, STATES.PROFILE_LIST);
+});

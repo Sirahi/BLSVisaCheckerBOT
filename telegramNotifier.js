@@ -5,9 +5,11 @@ const CFG = require("./config");
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-// Location and visa type are read from config rather than hardcoded, so these
-// notifications stay correct when the city or visa type changes.
-const LOCATION = (CFG.CITY && CFG.CITY.name) || "Unknown";
+// The city is per-alert now, not per-process: the bot searches more than one,
+// so a module-level constant would name the wrong one on the single message
+// this project exists to send. LOCATIONS is only for messages that describe the
+// whole run (startup, blocked, no-slots), which genuinely cover every city.
+const LOCATIONS = (CFG.CITIES || []).map((c) => c.name).join(' + ') || 'Unknown';
 const VISA_TYPE = CFG.FORM.VISA_TYPE;
 
 // Timestamp helper - 24-hour clock
@@ -34,11 +36,15 @@ const sendMessageToTelegram = async (message, parseMode = 'Markdown') => {
 };
 
 // 🎉 APPOINTMENT FOUND - with the available dates
-const notifyAppointmentFound = async (availableDates) => {
+const notifyAppointmentFound = async (availableDates, repeat = null) => {
   // Read the category if present
   const category = availableDates.length > 0 && availableDates[0].category
     ? availableDates[0].category
     : "Normal";
+
+  const city = availableDates.length > 0 && availableDates[0].city
+    ? availableDates[0].city
+    : LOCATIONS;
 
   const categoryEmoji = category === "Premium" ? "⭐️" : "🎫";
 
@@ -63,7 +69,7 @@ const notifyAppointmentFound = async (availableDates) => {
     datesText += `   💚 ${dates.join(' • ')}\n`;
   }
 
-  const location = `\n📍 *Location:* ${LOCATION} 🏛\n`;
+  const location = `\n📍 *Location:* ${city} 🏛\n`;
   const visaType = `🎫 *Visa type:* ${VISA_TYPE} ✈️\n`;
   const categoryInfo = `${categoryEmoji} *Category:* ${category}\n\n`;
 
@@ -71,7 +77,9 @@ const notifyAppointmentFound = async (availableDates) => {
   const link = `🔗 [Open the visa portal](${CFG.TELEGRAM.SLOT_OPEN_LINK})\n\n`;
 
   const footer = "⏰ " + stamp() + "\n";
-  const warning = "⚡️ _Be quick! Appointments go fast._ 🏃‍♂️💨";
+  // Numbered so N repeats read as one find being re-announced, not N finds.
+  const counter = repeat && repeat.total > 1 ? `🔔 *Alert ${repeat.attempt}/${repeat.total}* — ` : "";
+  const warning = counter + "⚡️ _Be quick! Appointments go fast._ 🏃‍♂️💨";
 
   const message = header + subHeader + summary + datesText + location + visaType + categoryInfo + action + link + footer + warning;
 
@@ -85,7 +93,7 @@ const notifyNoAppointments = async (monthsScanned) => {
   const info = `🔍 Checked ${monthsScanned} month(s)\n`;
   const result = "📅 No available dates right now 😢\n\n";
 
-  const location = `📍 ${LOCATION}\n`;
+  const location = `📍 ${LOCATIONS}\n`;
   const visaType = `🎫 ${VISA_TYPE}\n\n`;
 
   const footer = "⏰ " + stamp() + "\n";
@@ -103,7 +111,7 @@ const notifyAppointmentsClosed = async () => {
   const info = "😞 The appointment system is currently closed\n";
   const reason = "🇪🇸 Spain is not issuing appointments for this category\n\n";
 
-  const location = `📍 ${LOCATION}\n`;
+  const location = `📍 ${LOCATIONS}\n`;
   const visaType = `🎫 ${VISA_TYPE}\n\n`;
 
   const footer = "⏰ " + stamp() + "\n";
@@ -150,7 +158,7 @@ const notifyBotStarted = async () => {
   const info = "🤖 Spain visa hunter is active!\n\n";
 
   const settings = "⚙️ *What I am doing:*\n";
-  const location = `   📍 Watching ${LOCATION}\n`;
+  const location = `   📍 Watching ${LOCATIONS}\n`;
   const visaType = `   🎫 Looking for ${VISA_TYPE}\n`;
   const interval = "   ⏱ Checking on the configured schedule\n\n";
 
@@ -177,7 +185,11 @@ const notifyBotError = async (errorMessage) => {
 };
 
 // 🔔 SLOT PAGE REACHED BUT NOT READABLE
-const notifySlotPageReached = async (errorDetail) => {
+// cityName is per call. This message is the "the slot page is open, CHECK
+// MANUALLY NOW" alert - it wakes a human, and naming every configured centre
+// tells them to go and check a page without saying WHICH centre it belongs to.
+// LOCATIONS stays as the fallback for callers that genuinely cover every city.
+const notifySlotPageReached = async (errorDetail, cityName = null) => {
   const header = "🔔🔔🔔 *ATTENTION!* 🔔🔔🔔\n\n";
 
   const good = "✅ *REACHED THE SLOT SELECTION PAGE!*\n\n";
@@ -189,7 +201,7 @@ const notifySlotPageReached = async (errorDetail) => {
   const action = "👉 *CHECK MANUALLY NOW:*\n";
   const link = `🔗 [Open the visa portal](${CFG.TELEGRAM.SLOT_OPEN_LINK})\n\n`;
 
-  const location = `📍 ${LOCATION} | 🎫 ${VISA_TYPE}\n`;
+  const location = `📍 ${cityName || LOCATIONS} | 🎫 ${VISA_TYPE}\n`;
   const footer = "⏰ " + stamp() + "\n\n";
   const note = "⚡️ _The bot could not read the calendar, but you can._";
 
@@ -198,8 +210,42 @@ const notifySlotPageReached = async (errorDetail) => {
   return await sendMessageToTelegram(message);
 };
 
+
+// 🔁 REPEATED SLOT ALERTS
+//
+// A single notification is easy to sleep through, and a single network blip at
+// the moment of the find loses it outright. Fire N of them a few seconds apart
+// instead. COUNT includes the first, so 1 reproduces the old behaviour.
+//
+// Returns a handle - the caller MUST stop() it, because the pending interval
+// keeps the Node process (and therefore the held-open browser) alive.
+const startSlotAlerts = (availableDates) => {
+  const total = Math.max(1, CFG.TELEGRAM.SLOT_ALERT_COUNT || 1);
+  const gap = CFG.TELEGRAM.SLOT_ALERT_INTERVAL_MS || 5000;
+  let sent = 0;
+  let timer = null;
+
+  const fire = () => {
+    sent += 1;
+    const n = sent;
+    notifyAppointmentFound(availableDates, { attempt: n, total }).catch(() => {});
+    if (sent >= total && timer) { clearInterval(timer); timer = null; }
+  };
+
+  fire();
+  if (total > 1) timer = setInterval(fire, gap);
+
+  return {
+    get sent() { return sent; },
+    get total() { return total; },
+    get done() { return sent >= total; },
+    stop() { if (timer) { clearInterval(timer); timer = null; } },
+  };
+};
+
 module.exports = {
   sendMessageToTelegram,
+  startSlotAlerts,
   notifyAppointmentFound,
   notifyNoAppointments,
   notifyAppointmentsClosed,

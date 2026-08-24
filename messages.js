@@ -160,10 +160,19 @@ module.exports = {
     TELEGRAM_FAILED: (msg) => `❌ Could not send Telegram notification: ${msg}`,
     TELEGRAM_FAILED_SIMPLE: 'Could not send Telegram notification',
 
-    // === CITY ===
+    // === CITY / APPLICANT PROFILE ===
     CITY_SCAN_START: (name) => `🏙️ ${name} scan starting`,
     CITY_SCAN_DONE: (name) => `✅ ${name} scan finished`,
     CITY_SCAN_ERROR: (name, msg) => `❌ Error during the ${name} scan: ${msg}`,
+    PROFILE_LOCATION_SET: (city) => `📍 Applicant profile Location set to ${city}.`,
+    PROFILE_VISA_TYPE_OK: (type) => `✅ Profile Visa Type is already ${type}.`,
+    PROFILE_VISA_TYPE_SET: (type) => `✅ Profile Visa Type set to ${type}.`,
+    PROFILE_PROCEED_CLICKED: '➡️ Proceed clicked, waiting for the applicant frame...',
+    PROFILE_SUBMIT_CLICKED: '✅ Applicant frame submitted, waiting for the alert...',
+    // The confirmation alert is the only proof the portal saved the change.
+    // Its text has never been captured, so it is logged verbatim, never matched.
+    PROFILE_ALERT_ACCEPTED: (text) => `✅ Profile confirmation alert accepted: "${text || '(unreadable)'}"`,
+    PROFILE_ALERT_MISSING: 'No confirmation alert appeared after the profile Submit - the portal may not have saved the city change.',
 
     // === NORMAL SLOT ===
     NORMAL_SLOT_FOUND: '📅 Normal category — slot selection page',
@@ -177,5 +186,5 @@ module.exports = {
     MACHINE_DONE: (result, transitions, searches) =>
         `Run finished: ${result} after ${transitions} transitions. Searches used (all time): ${searches}.`,
     MACHINE_RESULTS: (results) =>
-        `Category results: ${Object.entries(results).map(([k, v]) => `${k}=${v}`).join(', ') || '(none)'}`,
+        `Results: ${Object.entries(results).map(([k, v]) => `${k}=${v}`).join(', ') || '(none)'}`,
 };

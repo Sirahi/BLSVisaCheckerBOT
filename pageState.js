@@ -15,6 +15,9 @@ const STATES = {
   LOGIN_EMAIL: 'LOGIN_EMAIL',
   HOME: 'HOME',
   UNKNOWN: 'UNKNOWN',
+  PROFILE_LIST: 'PROFILE_LIST',
+  PROFILE_FORM: 'PROFILE_FORM',
+  PROFILE_CONFIRM: 'PROFILE_CONFIRM',
 };
 
 const REASONS = {
@@ -101,6 +104,55 @@ async function deadEnd(driver) {
   return { state: STATES.DEAD_END, reason, evidence: info.text.slice(0, 300) };
 }
 
+// ---- The Manage Applicants subflow -------------------------------------
+//
+// Three overlays on ONE url - MyAppointments never navigates between them - so
+// they are separated by visible DOM, not by address.
+
+// The Kendo window that Proceed opens. Checked before profileForm because the
+// modal may still be in the DOM behind it.
+async function profileConfirm(driver) {
+  const hit = await driver.executeScript(`
+    ${VIS_FN}
+    const frames = [...document.querySelectorAll('iframe.k-content-frame')].filter(vis);
+    return frames.length ? frames.length + ' k-content-frame' : null;
+  `);
+  if (!hit) return null;
+  return { state: STATES.PROFILE_CONFIRM, reason: null, evidence: hit };
+}
+
+// The bootstrap modal holding Location + Visa Type. Both conjuncts are needed:
+// this portal pre-renders modals everywhere, and .modal-content alone matches
+// several that have nothing to do with the profile.
+async function profileForm(driver) {
+  const hit = await driver.executeScript(`
+    ${VIS_FN}
+    const modals = [...document.querySelectorAll('div.modal-content')].filter(vis);
+    for (const m of modals) {
+      const hasLocation = [...m.querySelectorAll('label')]
+        .some((l) => vis(l) && /Location/i.test(l.textContent));
+      const proceed = [...m.querySelectorAll('button')]
+        .find((b) => vis(b) && /Proceed/i.test(b.textContent));
+      if (hasLocation && proceed) return 'modal with Location + Proceed';
+    }
+    return null;
+  `);
+  if (!hit) return null;
+  return { state: STATES.PROFILE_FORM, reason: null, evidence: hit };
+}
+
+// Pinned to the url: a[onclick*="ManageApplicant"] is not unique enough alone.
+async function profileList(driver, url) {
+  if (!/\/appointmentdata\/myappointments/i.test(url)) return null;
+  const hit = await driver.executeScript(`
+    ${VIS_FN}
+    const links = [...document.querySelectorAll('a[onclick*="ManageApplicant"]')].filter(vis);
+    return links.length ? links.length + ' ManageApplicant link(s)' : null;
+  `);
+  if (!hit) return null;
+  return { state: STATES.PROFILE_LIST, reason: null, evidence: hit };
+}
+
 // Returns the REAL box-label's text, or null. The decoys are painted the
 // background colour, never hidden, so vis() cannot be used here.
 async function visibleCaptchaLabel(driver) {
@@ -134,7 +186,17 @@ async function captcha(driver) {
 // Deliberately loose. A missed slot notification is this project's worst
 // outcome, so the source-text fallback is kept alongside the element check.
 // This is the ONE permitted getPageSource-style test in the detector.
-async function slots(driver) {
+//
+// The one negative guard: MyAppointments is never a slots page. profileList
+// is URL-pinned AND requires a[onclick*="ManageApplicant"]; the real page has
+// never been captured, so if it turns out to use a <button onclick=
+// "ManageApplicant..."> instead of an <a>, profileList misses and this
+// predicate - which fires on ANY visible datepicker, and MyAppointments is an
+// appointments page - would raise a FALSE slots alert, waking a human at 3am
+// for nothing. The guard cannot cause a MISSED alert in exchange: the genuine
+// slots page lives on /appointment/newappointment, which this never touches.
+async function slots(driver, url) {
+  if (url && /\/appointmentdata\/myappointments/i.test(url)) return null;
   const hit = await driver.executeScript(`
     ${VIS_FN}
     if ([...document.querySelectorAll('input[data-role="datepicker"]')].some(vis)) {
@@ -204,11 +266,18 @@ async function unavailable(driver) {
 //
 // ORDER IS LOAD-BEARING:
 //  - deadEnd first: TryAgain's button href IS the Book Now selector.
+//  - the profile trio BEFORE slots: slots is deliberately loose (any visible
+//    datepicker), and MyAppointments is an appointments page. Ordered after
+//    slots, a profile page could fire a false slots alert.
+//  - profileConfirm before profileForm: the modal can linger behind the frame.
 //  - loginCaptcha before captcha: a visible password field is the only diff.
 //  - slots before visaForm: a successful search EXTENDS the form page.
 const PREDICATES = [
   unavailable,
   deadEnd,
+  profileConfirm,
+  profileForm,
+  profileList,
   loginCaptcha,
   captcha,
   slots,

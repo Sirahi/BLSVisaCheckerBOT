@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node main.js",
     "once": "node app.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "telegram-setup": "node tools/telegram-setup.js",
+    "telegram-test": "node tools/telegram-test.js"
   },
   "author": "",
   "license": "ISC",

@@ -6,13 +6,13 @@
  * were not rewritten as part of the state-machine work. Only their indentation
  * changed (they used to be inner functions of main()).
  *
- * createPortalActions() supplies exactly the eight deps createHandlers()
+ * createPortalActions() supplies exactly the 14 deps createHandlers()
  * expects, so handlers.js stays unit testable without a browser.
  */
 const { By, until, Key } = require('selenium-webdriver');
 const CFG = require('./config');
 const MSG = require('./messages');
-const { notifyAppointmentFound, notifySlotPageReached } = require('./telegramNotifier');
+const { startSlotAlerts, notifySlotPageReached } = require('./telegramNotifier');
 const { solveVisibleCaptcha } = require('./captchaSolver');
 const { capturePage } = require('./capture');
 
@@ -200,7 +200,9 @@ async function dismissVisibleModal(driver, context = '') {
 }
 
 // Slot scanning and notification function (avoids duplicated code)
-async function scanAndNotifySlots(driver, categoryName = "Normal") {
+async function scanAndNotifySlots(driver, item = { category: 'Normal', city: 'Unknown' }) {
+  const categoryName = item.category;
+  const cityName = item.city;
   // Find the date picker
   const allDatePickers = await driver.findElements(By.css('input.k-input[data-role="datepicker"]'));
 
@@ -220,7 +222,7 @@ async function scanAndNotifySlots(driver, categoryName = "Normal") {
     console.log(MSG.DATE_PICKER_NOT_FOUND);
     console.log(MSG.SLOT_NO_DATE_PICKER(categoryName));
     try {
-      await notifySlotPageReached(`${categoryName}: date picker not found, but the slot page is open!`);
+      await notifySlotPageReached(`${cityName}/${categoryName}: date picker not found, but the slot page is open!`, cityName);
     } catch (e) {
       console.log(MSG.TELEGRAM_FAILED_SIMPLE);
     }
@@ -279,7 +281,7 @@ async function scanAndNotifySlots(driver, categoryName = "Normal") {
     console.log(MSG.CALENDAR_NOT_OPENED);
     console.log(MSG.SLOT_NO_CALENDAR(categoryName));
     try {
-      await notifySlotPageReached(`${categoryName}: could not open the calendar, but the slot page is open!`);
+      await notifySlotPageReached(`${cityName}/${categoryName}: could not open the calendar, but the slot page is open!`, cityName);
     } catch (e) { console.log(MSG.TELEGRAM_FAILED_SIMPLE); }
     throw new Error("Could not open the calendar");
   }
@@ -290,7 +292,7 @@ async function scanAndNotifySlots(driver, categoryName = "Normal") {
   if (calendarExists.length === 0) {
     console.log(MSG.CALENDAR_ELEM_NOT_FOUND);
     try {
-      await notifySlotPageReached(`${categoryName}: no calendar element, but the slot page is open!`);
+      await notifySlotPageReached(`${cityName}/${categoryName}: no calendar element, but the slot page is open!`, cityName);
     } catch (e) { console.log(MSG.TELEGRAM_FAILED_SIMPLE); }
     throw new Error("No calendar element");
   }
@@ -368,7 +370,8 @@ async function scanAndNotifySlots(driver, categoryName = "Normal") {
               month: currentMonth,
               bgColor: colorInfo.bgColor,
               rgb: colorInfo.rgb,
-              category: categoryName
+              category: categoryName,
+              city: cityName
             });
             foundInThisMonth++;
           }
@@ -413,11 +416,26 @@ async function scanAndNotifySlots(driver, categoryName = "Normal") {
 
   if (availableDatesWithSlots.length === 0) {
     console.log(MSG.CALENDAR_NO_DATES_FOUND(categoryName));
-    return;
+    // Returning null here does NOT resume the cycle: handlers.js still treats
+    // the SLOTS page as terminal, so app.js exits 10 and the scheduler stops
+    // for the night with the remaining combos unsearched. That is the right
+    // call - reaching the slot page at all is worth stopping for - but doing
+    // it in total silence is not. Something has to say why the night ended.
+    try {
+      await notifySlotPageReached(
+        `${cityName}/${categoryName}: the slot page is open but the calendar showed no open dates.`,
+        cityName
+      );
+    } catch (e) { console.log(MSG.TELEGRAM_FAILED_SIMPLE); }
+    return null;
   }
 
+  // Repeating alerts, not one shot - see startSlotAlerts. The handle is
+  // returned so app.js can stop() it; the pending interval would otherwise
+  // keep the process alive past the hold.
+  let alerts = null;
   try {
-    await notifyAppointmentFound(availableDatesWithSlots);
+    alerts = startSlotAlerts(availableDatesWithSlots);
     console.log(MSG.TELEGRAM_SENT);
   } catch (e) {
     console.log(MSG.TELEGRAM_FAILED(e.message));
@@ -435,6 +453,17 @@ async function scanAndNotifySlots(driver, categoryName = "Normal") {
   }
 
   console.log(MSG.SCAN_DONE(categoryName));
+  return alerts;
+}
+
+// Shaped exactly like what scanAndNotifySlots collects off the calendar, but
+// the month is unmistakable on a phone screen - a simulated alert must never
+// be mistaken for a real one at 3am.
+function fakeSlotDates(item = { category: 'Normal', city: 'Unknown' }) {
+  return [
+    { text: '12', month: 'SIMULATION - NOT A REAL SLOT', category: item.category, city: item.city },
+    { text: '15', month: 'SIMULATION - NOT A REAL SLOT', category: item.category, city: item.city },
+  ];
 }
 
 // Resolve the VISIBLE element for a selector, or null. Never index into
@@ -451,6 +480,80 @@ async function clickIt(driver, el) {
   await driver.executeScript("arguments[0].scrollIntoView({block:'center'});", el);
   await driver.sleep(250);
   try { await el.click(); } catch (e) { await driver.executeScript('arguments[0].click();', el); }
+}
+
+// An OPEN alert makes switchTo().defaultContent() throw as well, so the alert
+// must be dealt with BEFORE trying to leave the frame - and tried again after,
+// because it can arrive late.
+//
+// Returns {seen, text}. `seen` is REPORTED rather than swallowed because it is
+// the only evidence the portal accepted the profile edit: this function used to
+// return normally whether or not an alert ever appeared, and the caller then
+// recorded a city change that may never have happened.
+//
+// The text is captured for the log only. It is deliberately NOT pattern-matched
+// to decide success - this page has never been captured and we do not know what
+// it says, so any match would be a guess dressed as a check.
+async function acceptProfileAlert(driver) {
+  const result = { seen: false, text: null };
+
+  const take = async () => {
+    const alert = await driver.switchTo().alert();
+    try { result.text = await alert.getText(); } catch (e) { /* unreadable is fine */ }
+    await alert.accept();
+    result.seen = true;
+  };
+
+  try {
+    await driver.wait(until.alertIsPresent(), 3000);
+    await take();
+  } catch (e) { /* not open yet - fall through */ }
+  try {
+    await driver.switchTo().defaultContent();
+  } catch (e) {
+    // defaultContent() throwing usually means a LATE alert is still open.
+    try { await take(); } catch (e2) { /* none */ }
+    try { await driver.switchTo().defaultContent(); } catch (e2) { /* already there */ }
+  }
+  return result;
+}
+
+// The real MyAppointments page has never been captured (see the module
+// comment), so we do not actually know the primary XPath below always
+// matches there. If it misses, the fallback CSS selector matches every
+// a[onclick*="ManageApplicant"] on the page - which, on the live portal,
+// plausibly includes an 'Add New Member' affordance and not just per-
+// applicant edit links. Clicking the wrong one would CREATE a new
+// applicant on the user's real visa account: an account-mutating action
+// on a live government portal, taken unattended. So the fallback must
+// fail closed - skip anything that reads like an add/delete affordance
+// rather than gamble on an unseen page - and throw if nothing safe is left.
+const NON_EDIT_ANCHOR_TEXT = /add\s*new|delete|remove/i;
+
+async function openApplicantEditImpl(driver, cfg) {
+  // Primary Applicant first; the generic fallback below also matches 'Add
+  // New Member' and every other applicant row, so it is text-guarded.
+  const strategies = [
+    By.xpath("//div[contains(@class,'row') and contains(@class,'border') and contains(., 'Primary Applicant')]//a[contains(@onclick,'ManageApplicant')]"),
+    By.css('a[onclick*="ManageApplicant"]'),
+  ];
+  for (let i = 0; i < strategies.length; i++) {
+    const isFallback = i === strategies.length - 1;
+    const els = await driver.findElements(strategies[i]);
+    for (const el of els) {
+      try {
+        if (!(await el.isDisplayed())) continue;
+        if (isFallback) {
+          const text = ((await el.getText()) || '').trim();
+          if (NON_EDIT_ANCHOR_TEXT.test(text)) continue; // fail closed, see comment above
+        }
+        await clickIt(driver, el);
+        await driver.sleep(cfg.SLEEP.LONG);
+        return;
+      } catch (e) { /* stale - try the next */ }
+    }
+  }
+  throw new Error('Manage Applicants edit button not found');
 }
 
 function createPortalActions({ email, password, cfg, log }) {
@@ -483,6 +586,19 @@ function createPortalActions({ email, password, cfg, log }) {
       throw new Error('Book Now button not found');
     },
 
+    // Direct navigation, not the nav dropdown. The Manage Applicants link is a
+    // .dropdown-item inside a collapsed menu; driving a hover menu is a
+    // needless failure mode when the URL is stable and already in config.
+    goToMyAppointments: async (driver) => {
+      await driver.get(cfg.MY_APPOINTMENTS_URL);
+      await driver.sleep(cfg.SLEEP.AFTER_LOGIN);
+    },
+
+    goHome: async (driver) => {
+      await driver.get(cfg.BASE_URL + cfg.BLS_HOME_URL);
+      await driver.sleep(cfg.SLEEP.AFTER_LOGIN);
+    },
+
     fillEmail: async (driver) => {
       const input = await firstVisible(driver, 'input[type="text"], input[type="email"]');
       if (!input) throw new Error('Email field not found');
@@ -511,13 +627,13 @@ function createPortalActions({ email, password, cfg, log }) {
       return solveVisibleCaptcha(driver, { isLogin: true });
     },
 
-    fillFormAndSubmit: async (driver, category) => {
+    fillFormAndSubmit: async (driver, item) => {
       await dismissVisibleModal(driver, 'page load'); // #scamAlert fires here
       const fields = [
-        ['Location', cfg.CITY.LOCATION],
+        ['Location', item.location],
         ['Visa Type', cfg.FORM.VISA_TYPE],
         ['Visa Sub Type', cfg.FORM.VISA_SUB_TYPE],
-        ['Category', category === 'Premium' ? cfg.FORM.CATEGORY_PREMIUM : cfg.FORM.CATEGORY_NORMAL],
+        ['Category', item.category === 'Premium' ? cfg.FORM.CATEGORY_PREMIUM : cfg.FORM.CATEGORY_NORMAL],
       ];
       for (const [label, value] of fields) {
         const ok = await selectKendoDropdownByLabel(driver, label, value);
@@ -533,7 +649,74 @@ function createPortalActions({ email, password, cfg, log }) {
     },
 
     // Signature stays exactly as moved - it reads CFG and MSG from module scope.
-    scanSlots: (driver, categoryName) => scanAndNotifySlots(driver, categoryName),
+    scanSlots: (driver, item) => scanAndNotifySlots(driver, item),
+    simulateSlotsFound: (item) => startSlotAlerts(fakeSlotDates(item)),
+
+    openApplicantEdit: async (driver) => openApplicantEditImpl(driver, cfg),
+
+    setProfileCity: async (driver, item) => {
+      await driver.wait(until.elementLocated(By.css('div.modal-content')), cfg.DROPDOWN.TIMEOUT);
+      await driver.sleep(cfg.SLEEP.MEDIUM);
+
+      const ok = await selectKendoDropdownByLabel(driver, 'Location', item.location);
+      if (!ok) throw new Error(`Profile Location "${item.location}" could not be selected`);
+      console.log(MSG.PROFILE_LOCATION_SET(item.city));
+      await driver.sleep(cfg.SLEEP.LONG);
+
+      // Compare against CFG.FORM.VISA_TYPE. The Turkey original tested for
+      // 'Schengen', which never matches this portal's 'National Visa' - so it
+      // silently re-selected the dropdown on every pass.
+      let current = '';
+      try {
+        const el = await firstVisible(driver, 'span[aria-owns="VisaType_listbox"] .k-input, .k-input[aria-controls="VisaType_listbox"]');
+        if (el) current = await el.getText();
+      } catch (e) { /* unreadable - fall through and set it */ }
+
+      if (current.toLowerCase().includes(cfg.FORM.VISA_TYPE.toLowerCase())) {
+        console.log(MSG.PROFILE_VISA_TYPE_OK(cfg.FORM.VISA_TYPE));
+      } else {
+        const vt = await selectKendoDropdownByLabel(driver, 'Visa Type', cfg.FORM.VISA_TYPE);
+        if (!vt) throw new Error('Profile Visa Type could not be selected');
+        console.log(MSG.PROFILE_VISA_TYPE_SET(cfg.FORM.VISA_TYPE));
+        await driver.sleep(cfg.SLEEP.MEDIUM);
+      }
+
+      const proceed = await driver.findElement(
+        By.xpath("//div[contains(@class,'modal-footer')]//button[contains(text(),'Proceed')]")
+      );
+      await clickIt(driver, proceed);
+      console.log(MSG.PROFILE_PROCEED_CLICKED);
+      await driver.sleep(cfg.SLEEP.LONG);
+    },
+
+    submitProfileFrame: async (driver) => {
+      await driver.wait(until.elementLocated(By.css('iframe.k-content-frame')), cfg.DROPDOWN.TIMEOUT);
+      await driver.sleep(cfg.SLEEP.MEDIUM);
+      const frame = await driver.findElement(By.css('iframe.k-content-frame'));
+      await driver.switchTo().frame(frame);
+      let alert = { seen: false, text: null };
+      try {
+        const btn = (await firstVisible(driver, 'button[type="submit"].btn-primary'))
+          || (await firstVisible(driver, 'button[type="submit"]'))
+          || (await firstVisible(driver, 'button.btn-primary'));
+        if (!btn) throw new Error('Profile Submit button not found inside the frame');
+        await clickIt(driver, btn);
+        console.log(MSG.PROFILE_SUBMIT_CLICKED);
+        await driver.sleep(cfg.SLEEP.MEDIUM);
+      } finally {
+        // Runs even when Submit was never found, so a failure can never strand
+        // the driver inside the iframe for the next detect(). If the try block
+        // threw, that error still wins - this only clears the frame.
+        alert = await acceptProfileAlert(driver);
+      }
+      // Reached only on the success path (a throw above skips it). The alert is
+      // the portal telling us it saved; without one, Proceed/Submit may have
+      // silently no-opped and the profile is still on the previous city.
+      // Throwing here is the safe outcome: handlers.js leaves profileCity unset,
+      // the run terminates, and no search is spent against the wrong city.
+      if (!alert.seen) throw new Error(MSG.PROFILE_ALERT_MISSING);
+      console.log(MSG.PROFILE_ALERT_ACCEPTED(alert.text));
+    },
   };
 }
 
@@ -542,6 +725,8 @@ module.exports = {
   selectKendoDropdownByLabel,
   dismissVisibleModal,
   scanAndNotifySlots,
+  fakeSlotDates,
   firstVisible,
   clickIt,
+  openApplicantEditImpl, // exported for the fail-closed guard's unit test
 };

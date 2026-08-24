@@ -56,3 +56,21 @@ test('a missing or corrupt search file starts at zero without throwing', () => {
   const c = createBudget({ limits: LIMITS, searchFile: f });
   assert.strictEqual(c.searchesUsed, 0);
 });
+
+test('the profile phase is chargeable and capped', () => {
+  const b = createBudget({ limits: { login: 3, preForm: 3, postForm: 3, unavailable: 5, profile: 3 }, searchFile: tmpFile() });
+  assert.strictEqual(b.charge('profile'), true);
+  assert.strictEqual(b.charge('profile'), true);
+  assert.strictEqual(b.charge('profile'), true);
+  assert.strictEqual(b.charge('profile'), false, 'the fourth attempt must be refused');
+  assert.strictEqual(b.exhausted, 'profile');
+});
+
+test('resetTraversal gives the next city a full profile allowance', () => {
+  const b = createBudget({ limits: { login: 3, preForm: 3, postForm: 3, unavailable: 5, profile: 3 }, searchFile: tmpFile() });
+  b.charge('profile');
+  b.charge('profile');
+  b.resetTraversal();
+  assert.strictEqual(b.counters.profile, 0);
+  assert.strictEqual(b.charge('profile'), true);
+});
