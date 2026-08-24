@@ -130,13 +130,48 @@ function searchLine() {
   return n === null ? 'Search total unknown.' : `Searches used all time: ${n}.`;
 }
 
-// exit code -> what the loop should do about it
+// exit code -> what the loop should do about it.
+//
+// `blocked` is its own axis rather than a flavour of `failure`. Folding it
+// into failure would eat MAX_CONSECUTIVE_FAILURES slots; folding it into the
+// clean path would RESET that streak, and an alternating crash/block pattern
+// would then never trip the failure cap at all.
 function classify(code) {
-  if (code === 0) return { result: 'NO_SLOTS', halt: false, failure: false };
-  if (code === 10) return { result: 'SLOTS_FOUND', halt: true, failure: false };
-  if (code === 20) return { result: 'UNKNOWN_TERMINAL', halt: true, failure: false };
-  if (code === 30) return { result: 'GUARD_ABORT', halt: false, failure: true };
-  return { result: 'CRASH', halt: false, failure: true };
+  if (code === 0) return { result: 'NO_SLOTS', halt: false, failure: false, blocked: false };
+  if (code === 10) return { result: 'SLOTS_FOUND', halt: true, failure: false, blocked: false };
+  if (code === 20) return { result: 'UNKNOWN_TERMINAL', halt: false, failure: false, blocked: true };
+  if (code === 30) return { result: 'GUARD_ABORT', halt: false, failure: true, blocked: false };
+  return { result: 'CRASH', halt: false, failure: true, blocked: false };
+}
+
+// Streak bookkeeping, pure so the reset rule is testable without spawning a
+// child. A cycle that gets through clears BOTH streaks - two blocks then a
+// successful run means the run after it is paced by the ordinary
+// morning/afternoon interval again, not by a multiplier still carrying blocks
+// that are over.
+function nextStreaks(prev, { blocked, failure }) {
+  if (blocked) return { failures: prev.failures, blocks: prev.blocks + 1 };
+  if (failure) return { failures: prev.failures + 1, blocks: prev.blocks };
+  return { failures: 0, blocks: 0 };
+}
+
+// A block is the portal rate-limiting the day's activity, and a night off is
+// exactly the remedy - so the block streak does NOT survive the night sleep.
+// Carrying it over meant an evening spent blocked resumed the next morning
+// mid-backoff, spending the most valuable window of the day on 120m waits
+// instead of a fresh 20m burst. The failure streak is untouched: a crash streak
+// is a broken setup, and sleeping does not fix chromedriver.
+function afterNightSleep(streaks) {
+  return { failures: streaks.failures, blocks: 0 };
+}
+
+// How long to wait after the nth consecutive block. n === 1 is the ordinary
+// interval for the time of day; each further unbroken block multiplies it, up
+// to the ceiling.
+function blockWaitMinutes(baseMin, consecutiveBlocks) {
+  const steps = Math.max(0, consecutiveBlocks - 1);
+  const grown = baseMin * Math.pow(S.BLOCK_BACKOFF_MULTIPLIER, steps);
+  return Math.min(grown, S.BLOCK_BACKOFF_MAX_MIN);
 }
 
 async function loop() {
@@ -158,7 +193,7 @@ async function loop() {
   logger.display('Sched', `Logging to ${logger.file}`);
 
   let cycle = 0;
-  let consecutiveFailures = 0;
+  let streaks = { failures: 0, blocks: 0 };
 
   while (true) {
     if (!isWorkingHours()) {
@@ -168,6 +203,10 @@ async function loop() {
         : fmt(wait);
       logger.display('Sched', `Outside working hours - sleeping ${label} until hour ${S.WORK_START_HOUR}.`);
       await sleep(wait);
+      if (streaks.blocks > 0) {
+        logger.display('Sched', `New day - clearing a block streak of ${streaks.blocks}; the morning starts at the ordinary ${S.MORNING_INTERVAL_MIN}m interval.`);
+      }
+      streaks = afterNightSleep(streaks);
       continue;
     }
 
@@ -177,7 +216,8 @@ async function loop() {
     logger.display('Sched', `Cycle ${cycle} starting (${morning ? 'morning' : 'afternoon'}, virtual hour ${currentHour()}).`);
 
     const code = await runOnce();
-    const { result, halt, failure } = classify(code);
+    const verdict = classify(code);
+    const { result, halt, blocked } = verdict;
     const durationMs = Date.now() - startedAt;
 
     recordCycle({
@@ -192,34 +232,49 @@ async function loop() {
 
     logger.display('Sched', `Cycle ${cycle} finished: ${result} (exit ${code}) in ${Math.round(durationMs / 1000)}s.`);
 
+    // SLOTS_FOUND is now the only outcome that stops the loop on its own.
     if (halt) {
-      if (result === 'SLOTS_FOUND') {
-        // app.js already fired the repeating alerts and is holding the browser.
-        logger.display('Sched', 'SLOTS FOUND - stopping the loop. The browser is being held open by the run.');
-      } else {
-        logger.error('Sched', 'Unrecognised terminal page - this is the likely block. Stopping so the capture can be read.');
-        // A halt during an unattended run is silent otherwise: the loop stops
-        // at 11am and nothing says so until someone looks at the terminal.
-        await tell(`Stopped after cycle ${cycle}: unrecognised terminal page (exit ${code}). This is probably the block. ${searchLine()}`);
-      }
+      // app.js already fired the repeating alerts and is holding the browser.
+      logger.display('Sched', 'SLOTS FOUND - stopping the loop. The browser is being held open by the run.');
       return;
     }
 
-    if (failure) {
-      consecutiveFailures += 1;
-      logger.warning('Sched', `${result} (${consecutiveFailures}/${S.MAX_CONSECUTIVE_FAILURES} consecutive).`);
-      if (consecutiveFailures >= S.MAX_CONSECUTIVE_FAILURES) {
+    const recovered = streaks.blocks > 0 && !blocked;
+    streaks = nextStreaks(streaks, verdict);
+
+    if (blocked) {
+      logger.error('Sched', `Unrecognised terminal page - the likely block (${streaks.blocks}/${S.MAX_CONSECUTIVE_BLOCKS} consecutive). The capture is written; retrying rather than stopping.`);
+      if (streaks.blocks >= S.MAX_CONSECUTIVE_BLOCKS) {
+        logger.error('Sched', 'Still blocked after the whole retry budget - stopping rather than hammering.');
+        await tell(`Stopped after cycle ${cycle}: still blocked after ${streaks.blocks} consecutive cycles (exit ${code}). ${searchLine()}`);
+        return;
+      }
+      // Only the FIRST block of a streak notifies. The repeats are expected
+      // from here on, and a Telegram every 20 minutes all afternoon trains you
+      // to ignore the one that matters.
+      if (streaks.blocks === 1) {
+        await tell(`Cycle ${cycle}: blocked (unrecognised terminal page, exit ${code}). Retrying with backoff instead of stopping; giving up after ${S.MAX_CONSECUTIVE_BLOCKS} consecutive blocks. ${searchLine()}`);
+      }
+    } else if (recovered) {
+      logger.display('Sched', 'Back in after the block - streak cleared, back to the ordinary interval.');
+      await tell(`Cycle ${cycle}: back in after the block (${result}). Normal pacing resumed. ${searchLine()}`);
+    }
+
+    if (streaks.failures > 0) {
+      logger.warning('Sched', `${result} (${streaks.failures}/${S.MAX_CONSECUTIVE_FAILURES} consecutive).`);
+      if (streaks.failures >= S.MAX_CONSECUTIVE_FAILURES) {
         logger.error('Sched', 'Too many consecutive failures - stopping rather than grinding.');
         await tell(`Stopped after cycle ${cycle}: ${S.MAX_CONSECUTIVE_FAILURES} consecutive failures (last was ${result}, exit ${code}). ${searchLine()}`);
         return;
       }
-    } else {
-      consecutiveFailures = 0;
     }
 
-    const interval = morning ? S.MORNING_INTERVAL_MIN : S.AFTERNOON_INTERVAL_MIN;
+    const baseInterval = morning ? S.MORNING_INTERVAL_MIN : S.AFTERNOON_INTERVAL_MIN;
+    const interval = blocked ? blockWaitMinutes(baseInterval, streaks.blocks) : baseInterval;
     const waitMs = scaled ? (interval / 60) * hourMs : interval * 60 * 1000;
-    logger.display('Sched', `Next check in ${scaled ? Math.round(waitMs / 1000) + 's (scaled)' : interval + 'm'}.`);
+    const label = scaled ? Math.round(waitMs / 1000) + 's (scaled)' : Math.round(interval) + 'm';
+    const backedOff = blocked && interval !== baseInterval ? ` (backed off from ${baseInterval}m)` : '';
+    logger.display('Sched', `Next check in ${label}${backedOff}.`);
     await sleep(waitMs);
   }
 }
@@ -227,4 +282,4 @@ async function loop() {
 // Guarded like app.js: requiring this file must not start polling the portal.
 if (require.main === module) loop();
 
-module.exports = { classify, loop, msUntilWorkStart };
+module.exports = { classify, loop, msUntilWorkStart, nextStreaks, blockWaitMinutes, afterNightSleep };

@@ -1,7 +1,8 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const { EXIT, EXIT_FATAL } = require('../app');
-const { classify } = require('../main');
+const { classify, nextStreaks, blockWaitMinutes } = require('../main');
+const S = require('../config').SCHEDULER;
 
 // app.js decides the code; main.js decides what to do about it. Nothing links
 // the two, so a value added on one side and missed on the other would fail
@@ -14,7 +15,10 @@ test('every code app.js can emit is classified by the scheduler', () => {
 });
 
 test('a clean no-slots cycle keeps the loop running', () => {
-  assert.deepStrictEqual(classify(EXIT.NO_SLOTS), { result: 'NO_SLOTS', halt: false, failure: false });
+  assert.deepStrictEqual(
+    classify(EXIT.NO_SLOTS),
+    { result: 'NO_SLOTS', halt: false, failure: false, blocked: false },
+  );
 });
 
 test('finding slots halts the loop and is not a failure', () => {
@@ -23,12 +27,28 @@ test('finding slots halts the loop and is not a failure', () => {
   assert.strictEqual(c.failure, false);
 });
 
-// UNKNOWN_REASON is the branch expected to catch the portal block. It must
-// stop the loop: retrying would spend the search budget against a wall and
-// bury the one capture that explains it.
-test('an unrecognised terminal page halts rather than retrying', () => {
-  assert.strictEqual(classify(EXIT.UNKNOWN_REASON).halt, true);
-  assert.strictEqual(classify(EXIT.UNKNOWN_PAGE).halt, true);
+// UNKNOWN_REASON is the branch expected to catch the portal block. It used to
+// halt the loop outright, which threw away the rest of the day: a block at
+// 11am left the bot dead until a human noticed. Every cycle spawns a fresh
+// browser and re-detects from whatever page it lands on, so there is nothing
+// to recover - the next cycle simply starts again from LOGIN or HOME.
+test('an unrecognised terminal page retries instead of halting the loop', () => {
+  for (const code of [EXIT.UNKNOWN_REASON, EXIT.UNKNOWN_PAGE]) {
+    assert.strictEqual(classify(code).halt, false, `exit ${code} should not halt`);
+    assert.strictEqual(classify(code).blocked, true, `exit ${code} should be flagged blocked`);
+  }
+});
+
+// A block carries its own counter. If it were classified as a failure it would
+// eat MAX_CONSECUTIVE_FAILURES slots; if it were classified as a clean cycle it
+// would RESET that streak, and an alternating crash/block pattern would then
+// never trip the failure cap at all.
+test('a block is neither a failure nor a clean cycle', () => {
+  const c = classify(EXIT.UNKNOWN_REASON);
+  assert.strictEqual(c.failure, false);
+  assert.strictEqual(c.blocked, true);
+  assert.strictEqual(classify(EXIT.NO_SLOTS).blocked, false);
+  assert.strictEqual(classify(EXIT.OSCILLATING).blocked, false);
 });
 
 test('guard aborts and crashes are failures but do not halt immediately', () => {
@@ -67,3 +87,39 @@ test('a caught handler throw is a guard abort, not a crash', () => {
   assert.strictEqual(classify(EXIT.HANDLER_ERROR).result, 'GUARD_ABORT');
 });
 
+// ---- Streak bookkeeping ------------------------------------------------
+//
+// Two independent streaks. Extracted from loop() so the reset rule can be
+// tested without spawning anything: loop() reads exit codes and sleeps, and
+// neither is worth mocking to assert on arithmetic.
+
+const FRESH = { failures: 0, blocks: 0 };
+
+test('a clean cycle clears both streaks so the next block starts the backoff over', () => {
+  const after = nextStreaks({ failures: 2, blocks: 3 }, classify(EXIT.NO_SLOTS));
+  assert.deepStrictEqual(after, FRESH);
+});
+
+// The whole point of the reset: blocked, blocked, then in. The cycle after
+// that must be paced by the ordinary morning/afternoon interval again, not by
+// a multiplier still carrying the two blocks that are now over.
+test('getting back in after a block streak restores the ordinary interval', () => {
+  let streaks = FRESH;
+  streaks = nextStreaks(streaks, classify(EXIT.UNKNOWN_REASON));
+  streaks = nextStreaks(streaks, classify(EXIT.UNKNOWN_REASON));
+  assert.strictEqual(streaks.blocks, 2);
+
+  streaks = nextStreaks(streaks, classify(EXIT.NO_SLOTS));
+  assert.strictEqual(streaks.blocks, 0);
+  assert.strictEqual(blockWaitMinutes(S.MORNING_INTERVAL_MIN, streaks.blocks + 1), S.MORNING_INTERVAL_MIN);
+});
+
+test('a block advances the block streak and leaves the failure streak alone', () => {
+  const after = nextStreaks({ failures: 2, blocks: 0 }, classify(EXIT.UNKNOWN_PAGE));
+  assert.deepStrictEqual(after, { failures: 2, blocks: 1 });
+});
+
+test('a guard abort advances the failure streak and leaves the block streak alone', () => {
+  const after = nextStreaks({ failures: 0, blocks: 2 }, classify(EXIT.OSCILLATING));
+  assert.deepStrictEqual(after, { failures: 1, blocks: 2 });
+});

@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert');
-const { msUntilWorkStart } = require('../main');
+const { msUntilWorkStart, blockWaitMinutes, afterNightSleep } = require('../main');
 const CFG = require('../config');
 
 const S = CFG.SCHEDULER;
@@ -42,3 +42,59 @@ test('the wait never lands short of the work hour', () => {
   }
 });
 
+// ---- Block backoff -----------------------------------------------------
+//
+// A block used to stop the loop. It now retries, which raises the opposite
+// risk: hammering an active block at the ordinary 20m cadence keeps re-tripping
+// it. The wait therefore grows with each consecutive block.
+
+test('the first block waits the ordinary interval for the time of day', () => {
+  assert.strictEqual(blockWaitMinutes(S.MORNING_INTERVAL_MIN, 1), S.MORNING_INTERVAL_MIN);
+  assert.strictEqual(blockWaitMinutes(S.AFTERNOON_INTERVAL_MIN, 1), S.AFTERNOON_INTERVAL_MIN);
+});
+
+test('each further consecutive block backs off by the multiplier', () => {
+  const m = S.BLOCK_BACKOFF_MULTIPLIER;
+  assert.strictEqual(blockWaitMinutes(20, 2), 20 * m);
+  assert.strictEqual(blockWaitMinutes(20, 3), 20 * m * m);
+});
+
+// Doubling reaches the daily ceiling in four blocks and spends the whole
+// afternoon asleep. The point is to ease off the portal, not to give up on it.
+test('the backoff is gentle - it never doubles from one block to the next', () => {
+  assert.ok(S.BLOCK_BACKOFF_MULTIPLIER > 1, 'a multiplier of 1 or less is not a backoff');
+  assert.ok(S.BLOCK_BACKOFF_MULTIPLIER < 2, 'the multiplier must stay below 2x');
+});
+
+test('the backoff is capped so a block streak cannot sleep through the whole day', () => {
+  assert.strictEqual(blockWaitMinutes(20, 99), S.BLOCK_BACKOFF_MAX_MIN);
+  assert.ok(S.BLOCK_BACKOFF_MAX_MIN >= S.AFTERNOON_INTERVAL_MIN);
+});
+
+// Guards the streak cap itself: without one, a hard IP ban would have an
+// unattended bot retrying until someone noticed.
+test('a block streak has a cap that eventually stops the loop', () => {
+  assert.ok(Number.isInteger(S.MAX_CONSECUTIVE_BLOCKS) && S.MAX_CONSECUTIVE_BLOCKS > 0);
+});
+
+// ---- The day boundary --------------------------------------------------
+//
+// The block streak used to survive the night sleep, so an evening spent
+// blocked meant the next morning resumed mid-backoff - 120m waits through the
+// most valuable window of the day instead of a fresh 20m burst.
+
+test('the night sleep clears the block streak so the morning starts at the ordinary interval', () => {
+  const after = afterNightSleep({ failures: 1, blocks: 7 });
+  assert.strictEqual(after.blocks, 0);
+  assert.strictEqual(
+    blockWaitMinutes(S.MORNING_INTERVAL_MIN, after.blocks + 1),
+    S.MORNING_INTERVAL_MIN,
+  );
+});
+
+// A block is the portal rate-limiting the day's activity, and a night off is
+// exactly the remedy. A crash streak is a broken setup - bad credentials, a
+// dead chromedriver - and sleeping does not fix any of those.
+test('the night sleep leaves the failure streak alone', () => {
+  assert.strictEqual(afterNightSleep({ failures: 2, blocks: 3 }).failures, 2);
+});

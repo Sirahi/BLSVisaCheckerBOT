@@ -145,6 +145,30 @@ module.exports = {
         // dropped VPN). Several in a row is not - stop rather than grind
         // through the night failing.
         MAX_CONSECUTIVE_FAILURES: 3,
+
+        // --- Block handling ---
+        //
+        // A block (exit 20) used to stop the loop outright, which threw away
+        // the rest of the day: blocked at 11am meant dead until a human
+        // noticed. It now retries instead. Every cycle spawns a fresh browser
+        // and re-detects from whatever page it lands on, so a blocked run
+        // leaves nothing to unwind - the next one starts again from LOGIN or
+        // HOME on its own.
+        //
+        // Retrying at the flat 20m morning cadence would just keep re-tripping
+        // an active block, so each CONSECUTIVE block waits longer than the
+        // last. Deliberately below 2x: doubling hits the ceiling in four
+        // blocks and sleeps away the afternoon. At 1.5x from 20m the waits run
+        // 20, 30, 45, 68, 101, then the ceiling.
+        BLOCK_BACKOFF_MULTIPLIER: 1.5,
+        // Ceiling on a single backed-off wait. The afternoon cadence is
+        // already 120m, so this is "never slower than the slowest normal
+        // pace".
+        BLOCK_BACKOFF_MAX_MIN: 120,
+        // The streak resets on any cycle that gets through, so this counts
+        // UNBROKEN blocks only. Without a cap a hard IP ban would have an
+        // unattended bot retrying until someone noticed.
+        MAX_CONSECUTIVE_BLOCKS: 12,
     },
 
     // === SIMULATION (testing only, off unless SIMULATE_SLOTS is set) ===
