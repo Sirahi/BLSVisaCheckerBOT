@@ -140,7 +140,7 @@ module.exports = {
         MORNING_END_HOUR: 12,  // intensive until here
         WORK_END_HOUR: 24,
         MORNING_INTERVAL_MIN: 20,
-        AFTERNOON_INTERVAL_MIN: 120,
+        AFTERNOON_INTERVAL_MIN: 40, // 120 Org
         // A guard trip or a crash is usually transient (a stale element, a
         // dropped VPN). Several in a row is not - stop rather than grind
         // through the night failing.
