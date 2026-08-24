@@ -4,7 +4,11 @@
   "description": "",
   "main": "main.js",
   "scripts": {
-    "start": "node main.js"
+    "start": "node main.js",
+    "once": "node app.js",
+    "test": "node --test test/*.test.js",
+    "telegram-setup": "node tools/telegram-setup.js",
+    "telegram-test": "node tools/telegram-test.js"
   },
   "author": "",
   "license": "ISC",
@@ -12,7 +16,7 @@
     "axios": "^1.10.0",
     "dotenv": "^17.2.0",
     "selenium-webdriver": "^4.34.0",
-    "sharp": "^0.34.2",
+    "sharp": "^0.35.3",
     "tesseract.js": "^7.0.0"
   }
 }
