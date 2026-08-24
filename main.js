@@ -249,15 +249,13 @@ async function loop() {
         await tell(`Stopped after cycle ${cycle}: still blocked after ${streaks.blocks} consecutive cycles (exit ${code}). ${searchLine()}`);
         return;
       }
-      // Only the FIRST block of a streak notifies. The repeats are expected
-      // from here on, and a Telegram every 20 minutes all afternoon trains you
-      // to ignore the one that matters.
-      if (streaks.blocks === 1) {
-        await tell(`Cycle ${cycle}: blocked (unrecognised terminal page, exit ${code}). Retrying with backoff instead of stopping; giving up after ${S.MAX_CONSECUTIVE_BLOCKS} consecutive blocks. ${searchLine()}`);
-      }
+      // Deliberately NO Telegram here. A block that is being retried is not an
+      // event that needs a human: the loop handles it and says so in the log.
+      // Telegram is reserved for the two things worth waking up for - the loop
+      // STOPPING, and a slot (which app.js announces itself, repeatedly). A
+      // message per block trains you to ignore the one that matters.
     } else if (recovered) {
       logger.display('Sched', 'Back in after the block - streak cleared, back to the ordinary interval.');
-      await tell(`Cycle ${cycle}: back in after the block (${result}). Normal pacing resumed. ${searchLine()}`);
     }
 
     if (streaks.failures > 0) {
