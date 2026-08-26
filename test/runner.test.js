@@ -9,7 +9,7 @@ const fs = require('fs');
 
 const LIMITS = { login: 3, preForm: 3, postForm: 3, unavailable: 5 };
 const tmp = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'r-')), 's.json');
-const CFG = { CITIES: [{ name: 'Islamabad', LOCATION: 'Islamabad' }], MACHINE: { MAX_TRANSITIONS: 40, OSCILLATION_LIMIT: 6, CATEGORIES: ['Normal', 'Premium'] } };
+const CFG = { ACTIVE_CITIES: [{ name: 'Islamabad', LOCATION: 'Islamabad' }], MACHINE: { MAX_TRANSITIONS: 40, OSCILLATION_LIMIT: 6, CATEGORIES: ['Normal', 'Premium'] } };
 
 function harness(sequence, handlers) {
   let i = 0;
@@ -54,7 +54,7 @@ test('repeating a state is fine while a counter advances', async () => {
 });
 
 test('the transition cap is a backstop', async () => {
-  const cfg = { CITIES: [{ name: 'Islamabad', LOCATION: 'Islamabad' }], MACHINE: { MAX_TRANSITIONS: 5, OSCILLATION_LIMIT: 99, CATEGORIES: ['Normal'] } };
+  const cfg = { ACTIVE_CITIES: [{ name: 'Islamabad', LOCATION: 'Islamabad' }], MACHINE: { MAX_TRANSITIONS: 5, OSCILLATION_LIMIT: 99, CATEGORIES: ['Normal'] } };
   let n = 0;
   const h = harness([STATES.CAPTCHA], {
     [STATES.CAPTCHA]: async (ctx) => { n++; ctx.budget.charge('preForm'); return { terminal: false }; },
@@ -70,12 +70,17 @@ test('a missing handler is reported, not thrown', async () => {
   assert.strictEqual(out.result, 'NO_HANDLER');
 });
 
+// MULTI_CITY explicit: these three assert the multi-city ordering, which is
+// no longer what a default config does. config.js resolves CITIES ->
+// ACTIVE_CITIES; buildPlan only ever sees the resolved list.
 const PLAN_CFG = {
-  CITIES: [
+  MULTI_CITY: true,
+  ACTIVE_CITIES: [
     { name: 'Islamabad', LOCATION: 'Islamabad' },
     { name: 'Lahore', LOCATION: 'Lahore' },
   ],
   MACHINE: { CATEGORIES: ['Normal', 'Premium'] },
+  FORM: { VISA_SUB_TYPE: 'Family Reunification' },
 };
 
 test('the plan is city-major: both categories run before the city changes', () => {
@@ -95,7 +100,49 @@ test('plan items carry the portal Location value, not just the display name', ()
     location: 'Islamabad',
     category: 'Normal',
     label: 'Islamabad/Normal',
+    visaSubType: 'Family Reunification',
   });
+});
+
+// ---- Per-city visa sub type --------------------------------------------
+//
+// The Visa Sub Type dropdown is served per LOCATION, not globally: the portal
+// loads it by AJAX once Location and Visa Type are set, and each centre
+// publishes its own catalogue. Islamabad offers "Family Reunification Visa";
+// Karachi offers only "National Visa" and "National Visas (Study, Work &
+// Other National Visas)", so the global FORM value can never match there.
+// Seen live 2026-08-27 - the run died at the sub type dropdown.
+
+test('a city without an override inherits the global sub type', () => {
+  const plan = buildPlan(PLAN_CFG);
+  assert.strictEqual(plan[0].visaSubType, 'Family Reunification');
+  assert.ok(plan.every((p) => p.visaSubType === 'Family Reunification'));
+});
+
+test('a city can override the sub type without disturbing the others', () => {
+  const plan = buildPlan({
+    ...PLAN_CFG,
+    ACTIVE_CITIES: [
+      { name: 'Islamabad', LOCATION: 'Islamabad' },
+      { name: 'Karachi', LOCATION: 'Karachi', VISA_SUB_TYPE: 'National Visa' },
+    ],
+  });
+  const sub = Object.fromEntries(plan.map((p) => [p.label, p.visaSubType]));
+  assert.strictEqual(sub['Islamabad/Normal'], 'Family Reunification');
+  assert.strictEqual(sub['Karachi/Normal'], 'National Visa');
+  assert.strictEqual(sub['Karachi/Premium'], 'National Visa');
+});
+
+// The override is per city, so it must ride on the plan ITEM. Reading
+// cfg.FORM at submit time would apply one city's sub type to every city in a
+// MULTI_CITY run - the exact bug this replaces.
+test('every plan item carries its own sub type', () => {
+  const plan = buildPlan({
+    ...PLAN_CFG,
+    ACTIVE_CITIES: [{ name: 'Karachi', LOCATION: 'Karachi', VISA_SUB_TYPE: 'National Visa' }],
+  });
+  assert.ok(plan.length > 0);
+  assert.ok(plan.every((p) => typeof p.visaSubType === 'string' && p.visaSubType));
 });
 
 test('city-major ordering means exactly one city boundary for two cities', () => {
@@ -126,7 +173,7 @@ test('charging profile changes the oscillation fingerprint', async () => {
   };
   const out = await run({
     driver: {}, detect, handlers, budget: b,
-    cfg: { CITIES: [{ name: 'Islamabad', LOCATION: 'Islamabad' }], MACHINE: { CATEGORIES: ['Normal'], MAX_TRANSITIONS: 60, OSCILLATION_LIMIT: 6 } },
+    cfg: { ACTIVE_CITIES: [{ name: 'Islamabad', LOCATION: 'Islamabad' }], MACHINE: { CATEGORIES: ['Normal'], MAX_TRANSITIONS: 60, OSCILLATION_LIMIT: 6 } },
     log: () => {},
   });
   assert.strictEqual(out.result, 'NO_SLOTS', 'progress via the profile counter must not trip the oscillation guard');

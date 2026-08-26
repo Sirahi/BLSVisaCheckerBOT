@@ -101,8 +101,11 @@ test('a clean cycle clears both streaks so the next block starts the backoff ove
 });
 
 // The whole point of the reset: blocked, blocked, then in. The cycle after
-// that must be paced by the ordinary morning/afternoon interval again, not by
-// a multiplier still carrying the two blocks that are now over.
+// that must be paced by an ordinary random draw again, not by a multiplier
+// still carrying the two blocks that are now over. Checked here through
+// blockWaitMinutes rather than the draw itself: if the streak really is clear
+// the loop takes the random branch, and a hypothetical block right after would
+// start the ladder from the bottom again.
 test('getting back in after a block streak restores the ordinary interval', () => {
   let streaks = FRESH;
   streaks = nextStreaks(streaks, classify(EXIT.UNKNOWN_REASON));
@@ -111,7 +114,7 @@ test('getting back in after a block streak restores the ordinary interval', () =
 
   streaks = nextStreaks(streaks, classify(EXIT.NO_SLOTS));
   assert.strictEqual(streaks.blocks, 0);
-  assert.strictEqual(blockWaitMinutes(S.MORNING_INTERVAL_MIN, streaks.blocks + 1), S.MORNING_INTERVAL_MIN);
+  assert.strictEqual(blockWaitMinutes(S.INTERVAL_MAX_MINUTES, streaks.blocks + 1), S.INTERVAL_MAX_MINUTES);
 });
 
 test('a block advances the block streak and leaves the failure streak alone', () => {
