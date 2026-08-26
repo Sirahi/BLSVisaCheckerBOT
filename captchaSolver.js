@@ -126,9 +126,77 @@ async function preprocessAdaptive(imgBuffer, cfg) {
 }
 
 // HELPER: run OCR for a single tile
-// TURBO MODE: multiple methods + early exit
+// ------------------------------------------------
+// All six configs are dispatched at once against a shared worker pool, and
+// every tile of a challenge is dispatched at once too, so a 9-tile challenge
+// is 54 recognitions in flight instead of ~30 run one after another.
+//
+// Two things made the old loop slow, and only one of them was the loop:
+// Tesseract.recognize() spawns a worker and reloads eng.traineddata on EVERY
+// call, so a single challenge paid that cost dozens of times. The pool below
+// pays it once per process. Measured on 9 real tiles from ../captcha-lab:
+// 4.5s -> 0.7s, byte-identical reads.
+//
+// The early-exit-at-3-votes rule is gone; it only ever existed to cut the
+// sequential cost, and in parallel it saves nothing. Running all six configs
+// is also what bench4.js measures, so the 94.4% figure now describes what
+// production actually does.
 // ============================================
-async function runOCRWithVoting(imgBuffer, boxIndex) {
+
+const TESS_PARAMS = {
+  tessedit_char_whitelist: '0123456789',
+  tessedit_pageseg_mode: '7', // Single TEXT LINE. PSM 8 (single word) measured ~44% vs 94% here.
+  tessedit_create_hocr: '0', // disable HOCR output (for speed)
+  tessedit_create_tsv: '0', // disable TSV output (for speed)
+  tessedit_create_pdf: '0', // disable PDF output (for speed)
+  preserve_interword_spaces: '0', // do not preserve interword spaces (not needed for digits)
+  classify_bln_numeric_mode: '1', // numeric mode - optimised for digits only
+  textord_min_linesize: '2.5', // minimum line size (for small digits)
+  classify_enable_learning: '0' // disable adaptive learning (for speed)
+};
+
+// 4 is enough: past that the bottleneck is preprocessAdaptive (sharp + the
+// pure-JS otsu/component passes), not Tesseract. n=12 measured no faster.
+const OCR_POOL_SIZE = Number(process.env.OCR_POOL_SIZE) || 4;
+
+let schedulerPromise = null;
+
+// Lazy so requiring this module costs nothing, shared so the ~0.4s spin-up is
+// paid once per app.js run rather than once per captcha.
+function getScheduler() {
+  if (!schedulerPromise) {
+    schedulerPromise = (async () => {
+      const scheduler = Tesseract.createScheduler();
+      await Promise.all(Array.from({ length: OCR_POOL_SIZE }, async () => {
+        // OEM 1 (LSTM only) has to be set at init - it is rejected by
+        // setParameters, which is why it is an argument here and not in
+        // TESS_PARAMS.
+        const worker = await Tesseract.createWorker('eng', 1, { logger: () => { } });
+        await worker.setParameters(TESS_PARAMS);
+        scheduler.addWorker(worker);
+      }));
+      return scheduler;
+    })().catch((e) => {
+      schedulerPromise = null; // let the next challenge retry the spin-up
+      throw e;
+    });
+  }
+  return schedulerPromise;
+}
+
+// Call before the process would otherwise sit idle holding live workers.
+// app.js exits via process.exit, but tests require() main() directly.
+async function shutdownOCR() {
+  if (!schedulerPromise) return;
+  const pending = schedulerPromise;
+  schedulerPromise = null;
+  try {
+    const scheduler = await pending;
+    await scheduler.terminate();
+  } catch (e) { /* already torn down or never came up */ }
+}
+
+async function runOCRWithVoting(imgBuffer) {
   // Adaptive configs. One is usually enough (93% alone); the spread covers
   // edge cases. Was 20 fixed-threshold colour configs at 74.1%.
   const ocrConfigs = [
@@ -140,62 +208,47 @@ async function runOCRWithVoting(imgBuffer, boxIndex) {
     { name: 'cd_b25_cc80',  blur: 2.5, resize: 3, minPx: 80 },
   ];
 
-  // Collect results for voting
-  const results = {};
-  const allResults = [];
-  const EARLY_EXIT_VOTES = 3; // stop once 3+ votes agree (for speed)
+  const scheduler = await getScheduler();
 
-  for (const config of ocrConfigs) {
+  const attempts = await Promise.all(ocrConfigs.map(async (config) => {
     try {
       ocrStats.totalAttempts++;
 
       // Process the image
       const processedBuffer = await preprocessAdaptive(imgBuffer, config);
 
-      // Run OCR - digits-only optimisation
-      const { data: { text, confidence } } = await Tesseract.recognize(
-        processedBuffer,
-        'eng',
-        {
-          logger: m => { },
-          tessedit_char_whitelist: '0123456789',
-          tessedit_pageseg_mode: '7', // Single TEXT LINE. PSM 8 (single word) measured ~44% vs 94% here.
-          tessedit_ocr_engine_mode: '1', // LSTM only - faster
-          tessedit_create_hocr: '0', // disable HOCR output (for speed)
-          tessedit_create_tsv: '0', // disable TSV output (for speed)
-          tessedit_create_pdf: '0', // disable PDF output (for speed)
-          preserve_interword_spaces: '0', // do not preserve interword spaces (not needed for digits)
-          classify_bln_numeric_mode: '1', // numeric mode - optimised for digits only
-          textord_min_linesize: '2.5', // minimum line size (for small digits)
-          classify_enable_learning: '0' // disable adaptive learning (for speed)
-        }
-      );
+      // Run OCR - digits-only optimisation, on whichever pool worker is free
+      const { data: { text, confidence } } = await scheduler.addJob('recognize', processedBuffer);
 
       // Keep digits only
-      const cleanText = text.replace(/\D/g, '');
+      const cleanText = (text || '').replace(/\D/g, '');
 
       // Check whether it is 3 digits
-      if (/^\d{3}$/.test(cleanText)) {
-        ocrStats.threeDigitReads++;
-
-        // Count for voting
-        if (!results[cleanText]) {
-          results[cleanText] = { count: 0, configs: [], totalConfidence: 0 };
-        }
-        results[cleanText].count++;
-        results[cleanText].configs.push(config.name);
-        results[cleanText].totalConfidence += confidence || 0;
-
-        allResults.push({ text: cleanText, config: config.name, confidence });
-
-        // EARLY EXIT: stop once enough votes agree
-        if (results[cleanText].count >= EARLY_EXIT_VOTES) {
-          break;
-        }
-      }
+      if (!/^\d{3}$/.test(cleanText)) return null;
+      return { text: cleanText, config: config.name, confidence };
     } catch (e) {
       // Skip silently
+      return null;
     }
+  }));
+
+  // Collect results for voting. Tallied after the fact rather than inside the
+  // map so the vote order stays config order regardless of completion order.
+  const results = {};
+  const allResults = [];
+
+  for (const attempt of attempts) {
+    if (!attempt) continue;
+    ocrStats.threeDigitReads++;
+
+    if (!results[attempt.text]) {
+      results[attempt.text] = { count: 0, configs: [], totalConfidence: 0 };
+    }
+    results[attempt.text].count++;
+    results[attempt.text].configs.push(attempt.config);
+    results[attempt.text].totalConfidence += attempt.confidence || 0;
+
+    allResults.push(attempt);
   }
 
   // Find the result with the most votes
@@ -337,22 +390,49 @@ async function selectCaptchaBoxes(driver, targetNumber, kind = 'captcha') {
 
   let clickedCount = 0;
 
-  for (let [idx, box] of boxesToScan.entries()) {
-    const { index: i, img, parentDiv } = box;
+  // ---- Phase 1: read every tile off the page (sequential) ----------------
+  // WebDriver is one command queue per session, so these round trips cannot
+  // overlap. They are cheap; the OCR they used to be interleaved with was not.
+  const tiles = [];
+  for (const box of boxesToScan) {
+    try {
+      const base64src = await box.img.getAttribute('src');
+      if (!base64src || !base64src.includes('base64')) continue;
+      tiles.push({ box, base64src, imgBuffer: Buffer.from(base64src.split(',')[1], 'base64') });
+    } catch (e) {
+      // Continue silently
+    }
+  }
+
+  // ---- Phase 2: OCR every tile at once (parallel, no driver involved) -----
+  // Nothing here touches the DOM, so the whole challenge goes through the
+  // worker pool in one shot instead of one tile at a time.
+  //
+  // The pool is brought up here rather than inside the map so that a failed
+  // spin-up throws once, with its real message, instead of being swallowed by
+  // nine per-tile catches and reported as a mystery "0/9 tiles".
+  await getScheduler();
+
+  const reads = await Promise.all(tiles.map(async (t) => {
+    try {
+      const { bestResult } = await runOCRWithVoting(t.imgBuffer);
+      return bestResult;
+    } catch (e) {
+      return null;
+    }
+  }));
+
+  // ---- Phase 3: click the matches (sequential) ---------------------------
+  // Kept in scan order so harvest output and click order are unchanged, and
+  // so the portal sees the same one-at-a-time interaction it did before.
+  for (const [n, t] of tiles.entries()) {
+    const { img, parentDiv, index: i } = t.box;
+    const bestResult = reads[n];
 
     try {
-      // Read the base64 image
-      const base64src = await img.getAttribute('src');
-      if (!base64src || !base64src.includes('base64')) continue;
-
-      const imgBuffer = Buffer.from(base64src.split(',')[1], 'base64');
-
-      // Run OCR with voting
-      const { bestResult } = await runOCRWithVoting(imgBuffer, i);
-
       // Save the tile before acting on it. Unreadable tiles are saved too -
       // those are the samples worth having.
-      harvest.saveTile(i, base64src, bestResult, bestResult && bestResult.text === targetNumber);
+      harvest.saveTile(i, t.base64src, bestResult, bestResult && bestResult.text === targetNumber);
 
       if (bestResult) {
         // Does it match the target number?
@@ -370,7 +450,6 @@ async function selectCaptchaBoxes(driver, targetNumber, kind = 'captcha') {
           } catch (e) { }
 
           if (!alreadySelected) {
-            // Click immediately - avoids a stale element
             let clicked = false;
             try {
               await parentDiv.click();
@@ -490,11 +569,13 @@ module.exports = {
   // exported so ../captcha-lab can benchmark the real pipeline offline
   preprocessAdaptive,
   otsuThreshold,
+  runOCRWithVoting,
   solveVisibleCaptcha,
   findTargetNumber,
   selectCaptchaBoxes,
   calculateOCRSuccessRate,
   resetOCRStats,
+  shutdownOCR,
   ocrStats
 }
 

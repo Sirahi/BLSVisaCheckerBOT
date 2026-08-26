@@ -9,7 +9,10 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 // so a module-level constant would name the wrong one on the single message
 // this project exists to send. LOCATIONS is only for messages that describe the
 // whole run (startup, blocked, no-slots), which genuinely cover every city.
-const LOCATIONS = (CFG.CITIES || []).map((c) => c.name).join(' + ') || 'Unknown';
+//
+// ACTIVE_CITIES, not CITIES: with multi-city switched off a run-level message
+// naming both would tell a human at 3am to check a city the bot never looked at.
+const LOCATIONS = (CFG.ACTIVE_CITIES || CFG.CITIES || []).map((c) => c.name).join(' + ') || 'Unknown';
 const VISA_TYPE = CFG.FORM.VISA_TYPE;
 
 // Timestamp helper - 24-hour clock

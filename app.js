@@ -16,6 +16,7 @@ const { createHandlers } = require('./handlers');
 const { createPortalActions } = require('./portalActions');
 const { createLogger } = require('./logger');
 const { run } = require('./runner');
+const { shutdownOCR } = require('./captchaSolver');
 
 require('dotenv').config();
 
@@ -142,6 +143,9 @@ async function main() {
   }
 
   if (outcome && outcome.alerts) outcome.alerts.stop();
+  // The OCR worker pool is process-wide and lazily spun up; released here so
+  // requiring main() from a test does not leave live workers holding the loop.
+  await shutdownOCR();
   try {
     await driver.quit();
   } catch (e) {
