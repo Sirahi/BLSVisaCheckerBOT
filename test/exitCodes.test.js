@@ -126,3 +126,23 @@ test('a guard abort advances the failure streak and leaves the block streak alon
   const after = nextStreaks({ failures: 0, blocks: 2 }, classify(EXIT.OSCILLATING));
   assert.deepStrictEqual(after, { failures: 1, blocks: 2 });
 });
+
+// A CONFIRMED block, as opposed to a page the detector merely failed to
+// recognise. The portal serves two of these ("Too Many Requests" from the
+// origin, a CloudFront 403 from the edge) and both were landing as
+// UNKNOWN_PAGE, which reported them in the log as "unrecognised - a human
+// should look". They are separated from UNKNOWN so the log can state the
+// difference, but they must still be paced by the SAME back-off: the response
+// to a rate limit does not change just because we can now name it.
+test('a confirmed block backs off exactly like an unrecognised one', () => {
+  const c = classify(EXIT.BLOCKED);
+  assert.strictEqual(c.blocked, true, 'a confirmed block must drive the back-off');
+  assert.strictEqual(c.halt, false, 'a block is retried, not fatal');
+  assert.strictEqual(c.failure, false, 'a block has its own counter');
+});
+
+test('a confirmed block is distinguishable from an unrecognised page', () => {
+  assert.notStrictEqual(EXIT.BLOCKED, EXIT.UNKNOWN_PAGE,
+    'sharing a code makes the two indistinguishable in the log');
+  assert.notStrictEqual(classify(EXIT.BLOCKED).result, classify(EXIT.UNKNOWN_PAGE).result);
+});

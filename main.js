@@ -159,6 +159,8 @@ function classify(code) {
   if (code === 0) return { result: 'NO_SLOTS', halt: false, failure: false, blocked: false };
   if (code === 10) return { result: 'SLOTS_FOUND', halt: true, failure: false, blocked: false };
   if (code === 20) return { result: 'UNKNOWN_TERMINAL', halt: false, failure: false, blocked: true };
+  // Same axis, same back-off, different story in the log.
+  if (code === 21) return { result: 'BLOCKED', halt: false, failure: false, blocked: true };
   if (code === 30) return { result: 'GUARD_ABORT', halt: false, failure: true, blocked: false };
   return { result: 'CRASH', halt: false, failure: true, blocked: false };
 }
@@ -239,7 +241,10 @@ async function loop() {
     recordCycle(ledgerEntry({ cycle, code, result, durationMs, waitMin }));
 
     if (blocked) {
-      logger.error('Sched', `Unrecognised terminal page - the likely block (${streaks.blocks}/${S.MAX_CONSECUTIVE_BLOCKS} consecutive). The capture is written; retrying rather than stopping.`);
+      const what = result === 'BLOCKED'
+        ? 'The portal served its rate-limit page'
+        : 'Unrecognised terminal page - the likely block. The capture is written';
+      logger.error('Sched', `${what} (${streaks.blocks}/${S.MAX_CONSECUTIVE_BLOCKS} consecutive). Retrying rather than stopping.`);
       if (streaks.blocks >= S.MAX_CONSECUTIVE_BLOCKS) {
         logger.error('Sched', 'Still blocked after the whole retry budget - stopping rather than hammering.');
         await tell(`Stopped after cycle ${cycle}: still blocked after ${streaks.blocks} consecutive cycles (exit ${code}). ${searchLine()}`);

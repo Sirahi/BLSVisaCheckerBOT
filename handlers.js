@@ -235,6 +235,16 @@ function createHandlers(deps) {
       return CONTINUE;
     },
 
+    // No capture, deliberately. A capture exists to let a human identify a page
+    // nobody has classified; this one IS classified, and writing a directory
+    // per block only buries the genuinely unrecognised captures among them.
+    // Twelve blocked cycles a day is twelve directories of a page we can
+    // already recite.
+    [STATES.BLOCKED]: async (ctx) => {
+      ctx.log(`Portal block: ${ctx.detected.evidence}. Backing off - no capture needed, this page is known.`);
+      return { terminal: true, result: 'BLOCKED', note: ctx.detected.evidence };
+    },
+
     [STATES.UNKNOWN]: async (ctx) => {
       const dir = await capture(ctx.driver, 'UNKNOWN', ctx.detected);
       ctx.log(`Unrecognised page - captured to ${dir}`);
