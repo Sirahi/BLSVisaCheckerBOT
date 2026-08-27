@@ -381,3 +381,63 @@ test('the rejection branch itself charges nothing', async () => {
   await h[STATES.DEAD_END](c);
   assert.strictEqual(c.budget.counters.preForm, 0, 'the solve that produced this was already charged');
 });
+
+// ===========================================================================
+// The captcha 119 loop of 2026-08-27, cycle 3.
+//
+// The OCR read none of the nine tiles as the target, and the solver submitted
+// an EMPTY selection anyway. The portal answered with an alert - "Please
+// select correct number boxes" - and re-served the SAME challenge. That
+// repeated eight times against the same target, 119, until the preForm budget
+// was exhausted and the cycle was thrown away:
+//
+//   Captcha 119: 0/9 tiles, submitted     x8
+//   Captcha attempt failed: unexpected alert open: {Alert text : Please select correct number boxes}
+//   Budget exhausted for preForm - stopping.
+//
+// A zero-tile submission cannot succeed: the target is always drawn from the
+// tiles on screen, so the right answer always has at least one. Submitting it
+// buys nothing and costs a budget charge, an alert, and another go at the
+// identical unreadable image. The only way out is a DIFFERENT challenge.
+const { STATES: ST } = require('../pageState');
+
+test('a captcha the solver could not read at all is not resubmitted', async () => {
+  const refreshed = [];
+  const c = ctx();
+  c.driver.navigate = () => ({ refresh: async () => { refreshed.push('refresh'); } });
+  const h = createHandlers({
+    ...noopDeps(),
+    solve: async () => ({ ok: false, reason: 'NO_TILES_MATCHED', clicked: 0 }),
+  });
+  const out = await h[ST.CAPTCHA](c);
+  assert.strictEqual(out.terminal, false, 'the run continues - this is recoverable');
+  assert.deepStrictEqual(refreshed, ['refresh'],
+    'an unreadable challenge must be replaced, not re-attempted as-is');
+});
+
+// The ordinary rejection path must NOT start refreshing. A captcha that was
+// submitted and refused is answered by the portal's own dead-end button, and
+// that route is what keeps the traversal on rails.
+test('an ordinary failed captcha attempt does not refresh the page', async () => {
+  const refreshed = [];
+  const c = ctx();
+  c.driver.navigate = () => ({ refresh: async () => { refreshed.push('refresh'); } });
+  const h = createHandlers({
+    ...noopDeps(),
+    solve: async () => ({ ok: false, reason: 'ALERT: something else', clicked: 3 }),
+  });
+  await h[ST.CAPTCHA](c);
+  assert.deepStrictEqual(refreshed, [], 'only an unreadable challenge is refreshed');
+});
+
+test('the login captcha is refreshed on the same terms', async () => {
+  const refreshed = [];
+  const c = ctx({ state: { phase: 'login', plan: [ISB_N], results: {}, profileCity: null, searchesAtStart: 0, planSize: 1 } });
+  c.driver.navigate = () => ({ refresh: async () => { refreshed.push('refresh'); } });
+  const h = createHandlers({
+    ...noopDeps(),
+    fillPasswordAndSolve: async () => ({ ok: false, reason: 'NO_TILES_MATCHED', clicked: 0 }),
+  });
+  await h[ST.LOGIN_CAPTCHA](c);
+  assert.deepStrictEqual(refreshed, ['refresh']);
+});
