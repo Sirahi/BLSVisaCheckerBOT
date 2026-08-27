@@ -209,3 +209,77 @@ test('the shipped config values match the option text the portal renders', () =>
   const karachi = CFG.CITIES.find((c) => c.name === 'Karachi');
   if (karachi) assert.strictEqual(optionMatches('National Visa', karachi.VISA_SUB_TYPE), true);
 });
+
+// ===========================================================================
+// The Visa Sub Type failure of 2026-08-27.
+//
+// Four cycles that day died with:
+//     "Visa Sub Type: could not select "National Visa""
+//     ">>> list never rendered - dropdown did not open"
+// and each one was a whole cycle thrown away.
+//
+// The log separates the failures from the successes perfectly. Selecting
+// Visa Type = "National Visa/ Long Term Visa" makes the portal raise an
+// "Information" modal over the form. In all SEVEN cycles that got through,
+// the next line is:
+//     "Modal dismissed after Visa Type: "Information" -> Ok"
+// In all FOUR that failed, that line is absent - the modal was never
+// dismissed, so it (and its backdrop) were still sitting over the Visa Sub
+// Type dropdown when the code tried to open it.
+//
+// The modal is raised by the portal's own change handler and fades in. The
+// old dismissVisibleModal swept the DOM exactly ONCE, the instant the
+// dropdown selection returned, and reported "no modal" if it had not appeared
+// yet. That is a race, and the log is the record of it being lost four times.
+const { dismissVisibleModal } = require('../portalActions');
+
+// A modal that only becomes visible on the Nth sweep - the fade-in, modelled.
+// `appearsOnPoll: 0` is a modal that was already up when the sweep started.
+function fakeModalDriver({ appearsOnPoll = 0 } = {}) {
+  const state = { polls: 0, clicked: [] };
+  const button = {
+    getText: async () => 'Ok',
+    click: async () => { state.clicked.push('Ok'); state.dismissed = true; },
+  };
+  const modal = {
+    isDisplayed: async () => !state.dismissed && state.polls > appearsOnPoll,
+    getCssValue: async () => (!state.dismissed && state.polls > appearsOnPoll ? 'block' : 'none'),
+    findElement: async (by) => {
+      if (String(by.value).includes('modal-title')) return { getText: async () => 'Information' };
+      return button;
+    },
+  };
+  return {
+    state,
+    sleep: async () => {},
+    executeScript: async () => {},
+    findElements: async () => { state.polls += 1; return [modal]; },
+  };
+}
+
+test('a modal that is already up is dismissed on the first sweep', async () => {
+  const d = fakeModalDriver({ appearsOnPoll: 0 });
+  const ok = await dismissVisibleModal(d, 'Visa Type', { waitMs: 1000 });
+  assert.strictEqual(ok, true);
+  assert.deepStrictEqual(d.state.clicked, ['Ok']);
+});
+
+// THE REGRESSION. The modal takes a few hundred ms to fade in; the old
+// single-sweep version returned false here and left it covering the form.
+test('a modal that fades in a moment later is still dismissed', async () => {
+  const d = fakeModalDriver({ appearsOnPoll: 3 });
+  const ok = await dismissVisibleModal(d, 'Visa Type', { waitMs: 2000 });
+  assert.strictEqual(ok, true, 'the modal must be waited for, not sampled once');
+  assert.deepStrictEqual(d.state.clicked, ['Ok'],
+    'an undismissed Information modal is what blocks the Visa Sub Type dropdown');
+});
+
+// The other half of the contract: most fields raise no modal at all, and
+// waiting the full budget on every one of them would add seconds to every
+// form fill for nothing. With no wait asked for, it must sweep once and go.
+test('with no wait budget it still sweeps exactly once and returns', async () => {
+  const d = fakeModalDriver({ appearsOnPoll: 99 });
+  const ok = await dismissVisibleModal(d, 'Location');
+  assert.strictEqual(ok, false);
+  assert.strictEqual(d.state.polls, 1, 'a no-wait call must not poll in a loop');
+});

@@ -28,7 +28,7 @@ const path = require('path');
 
 const CFG = require('./config');
 const { createLogger, hourIn } = require('./logger');
-const { notifyBotError } = require('./telegramNotifier');
+const { notifyBotError, setLogger: setTelegramLogger } = require('./telegramNotifier');
 
 const S = CFG.SCHEDULER;
 const TZ = S.TIMEZONE || null;
@@ -125,9 +125,20 @@ function readSearchTotal() {
 
 // Telegram must never take the scheduler down with it - a failed notification
 // is strictly less important than the log line that records the halt.
+//
+// It must also never be SILENT. This logger runs with tee:false, so the
+// notifier's own console.error went to a terminal and left nothing on disk:
+// on 2026-08-27 the halt notification was rejected by Telegram with a 400 and
+// the log file recorded a clean stop with no hint that nobody had been told.
+// Route the notifier's failures through the logger, and record the verdict of
+// every attempt.
+setTelegramLogger((msg) => logger.error('Sched', msg));
+
 async function tell(message) {
   try {
-    await notifyBotError(message);
+    const ok = await notifyBotError(message);
+    if (!ok) logger.error('Sched', 'Telegram did NOT deliver the halt notification - nobody has been told.');
+    else logger.display('Sched', 'Halt notification sent to Telegram.');
   } catch (e) {
     logger.warning('Sched', `Telegram notification failed: ${e.message}`);
   }
@@ -148,6 +159,8 @@ function classify(code) {
   if (code === 0) return { result: 'NO_SLOTS', halt: false, failure: false, blocked: false };
   if (code === 10) return { result: 'SLOTS_FOUND', halt: true, failure: false, blocked: false };
   if (code === 20) return { result: 'UNKNOWN_TERMINAL', halt: false, failure: false, blocked: true };
+  // Same axis, same back-off, different story in the log.
+  if (code === 21) return { result: 'BLOCKED', halt: false, failure: false, blocked: true };
   if (code === 30) return { result: 'GUARD_ABORT', halt: false, failure: true, blocked: false };
   return { result: 'CRASH', halt: false, failure: true, blocked: false };
 }
@@ -228,7 +241,10 @@ async function loop() {
     recordCycle(ledgerEntry({ cycle, code, result, durationMs, waitMin }));
 
     if (blocked) {
-      logger.error('Sched', `Unrecognised terminal page - the likely block (${streaks.blocks}/${S.MAX_CONSECUTIVE_BLOCKS} consecutive). The capture is written; retrying rather than stopping.`);
+      const what = result === 'BLOCKED'
+        ? 'The portal served its rate-limit page'
+        : 'Unrecognised terminal page - the likely block. The capture is written';
+      logger.error('Sched', `${what} (${streaks.blocks}/${S.MAX_CONSECUTIVE_BLOCKS} consecutive). Retrying rather than stopping.`);
       if (streaks.blocks >= S.MAX_CONSECUTIVE_BLOCKS) {
         logger.error('Sched', 'Still blocked after the whole retry budget - stopping rather than hammering.');
         await tell(`Stopped after cycle ${cycle}: still blocked after ${streaks.blocks} consecutive cycles (exit ${code}). ${searchLine()}`);

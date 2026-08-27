@@ -29,6 +29,23 @@ function createHandlers(deps) {
     submitProfileFrame,     // (driver) -> void
   } = deps;
 
+  // A challenge the OCR could not read AT ALL is not a failed attempt, it is an
+  // unusable image. The solver no longer submits an empty answer for it (that
+  // is always rejected), so nothing has changed on the page and re-detecting
+  // would hand back the identical unreadable challenge - which on 2026-08-27
+  // it did eight times running until the budget died.
+  //
+  // Refreshing draws a NEW challenge. The state machine re-detects from
+  // wherever that lands, so this needs no knowledge of which page it is on:
+  // the login captcha, the entry captcha, or a bounce back to the email step
+  // are all states with handlers.
+  async function freshChallenge(ctx, r) {
+    if (!r || r.reason !== 'NO_TILES_MATCHED') return;
+    ctx.log('Captcha unreadable (no tile matched the target) - reloading for a different one.');
+    await ctx.driver.navigate().refresh();
+    await ctx.driver.sleep(1500);
+  }
+
   async function chargeOrStop(ctx, phase, note) {
     if (ctx.budget.charge(phase)) return null;
     ctx.log(`Budget exhausted for ${phase} - stopping.`);
@@ -62,6 +79,7 @@ function createHandlers(deps) {
       if (stop) return stop;
       const r = await fillPasswordAndSolve(ctx.driver);
       if (!r.ok) ctx.log(`Login captcha attempt failed: ${r.reason}`);
+      await freshChallenge(ctx, r);
       return CONTINUE;
     },
 
@@ -86,6 +104,7 @@ function createHandlers(deps) {
       if (stop) return stop;
       const r = await solve(ctx.driver, { isLogin: phase === 'login' });
       if (!r.ok) ctx.log(`Captcha attempt failed: ${r.reason}`);
+      await freshChallenge(ctx, r);
       return CONTINUE;
     },
 
@@ -233,6 +252,16 @@ function createHandlers(deps) {
       await ctx.driver.sleep(5000);
       await ctx.driver.navigate().refresh();
       return CONTINUE;
+    },
+
+    // No capture, deliberately. A capture exists to let a human identify a page
+    // nobody has classified; this one IS classified, and writing a directory
+    // per block only buries the genuinely unrecognised captures among them.
+    // Twelve blocked cycles a day is twelve directories of a page we can
+    // already recite.
+    [STATES.BLOCKED]: async (ctx) => {
+      ctx.log(`Portal block: ${ctx.detected.evidence}. Backing off - no capture needed, this page is known.`);
+      return { terminal: true, result: 'BLOCKED', note: ctx.detected.evidence };
     },
 
     [STATES.UNKNOWN]: async (ctx) => {

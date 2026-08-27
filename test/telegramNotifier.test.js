@@ -41,3 +41,57 @@ test('with no city supplied it still falls back to the configured centres', asyn
     assert.match(posts[0].text, new RegExp(name), `the alert must name ${name}`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Telegram's legacy Markdown treats _ * ` [ as entity delimiters and offers NO
+// backslash escape (verified against the live API: "\_" fails exactly as "_"
+// does). So any runtime string interpolated into a *bold* or _italic_ span can
+// desynchronise the parser and make Telegram reject the WHOLE message with
+// HTTP 400 - it is not delivered garbled, it is not delivered at all.
+//
+// This is not hypothetical. On 2026-08-27 the scheduler halted and sent
+// notifyBotError("...last was GUARD_ABORT, exit 30..."). The underscore in
+// GUARD_ABORT closed the italic span early, the trailing "_" of the footer was
+// then left unterminated, and Telegram answered:
+//
+//   400 can't parse entities: Can't find end of the entity starting at byte 204
+//
+// The one message whose entire job is to say "the bot has stopped" was the one
+// message that never arrived.
+const { notifyBotError, notifyFormError } = require('../telegramNotifier');
+
+// Balanced-pair check for the four legacy-Markdown delimiters. Telegram itself
+// is stricter than this, but an odd count is always a rejection.
+function delimitersBalanced(text) {
+  for (const ch of ['_', '*', '`']) {
+    const n = text.split(ch).length - 1;
+    if (n % 2 !== 0) return { ok: false, ch, n };
+  }
+  return { ok: true };
+}
+
+test('a halt reason containing an underscore does not break the message', async () => {
+  posts.length = 0;
+  await notifyBotError('Stopped after cycle 14: 3 consecutive failures (last was GUARD_ABORT, exit 30). Searches used all time: 137.');
+  assert.strictEqual(posts.length, 1);
+  const b = delimitersBalanced(posts[0].text);
+  assert.ok(b.ok, `unbalanced "${b.ch}" (${b.n}) - Telegram rejects this with 400 and the halt is never announced`);
+  assert.match(posts[0].text, /GUARD.ABORT/, 'the reason must still be readable');
+});
+
+test('markdown delimiters in a form-error step cannot break the message', async () => {
+  posts.length = 0;
+  await notifyFormError('Visa_Sub*Type`[');
+  assert.strictEqual(posts.length, 1);
+  assert.ok(delimitersBalanced(posts[0].text).ok);
+});
+
+// The highest-stakes message in the project: it exists to wake a human and
+// send them to a page that may have open slots. It must survive whatever the
+// city name and the error detail happen to contain.
+test('the slot alert survives markdown delimiters in city and detail', async () => {
+  posts.length = 0;
+  await notifySlotPageReached('Karachi/Premium: date_picker not found *at all*', 'Kara_chi');
+  assert.strictEqual(posts.length, 1);
+  assert.ok(delimitersBalanced(posts[0].text).ok);
+});

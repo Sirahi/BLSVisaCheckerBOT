@@ -27,7 +27,9 @@ require('dotenv').config();
  *
  *    0  nothing found, keep polling
  *   10  SLOTS FOUND      - stop everything
- *   20  unrecognised terminal page - the likely block. Stop and let a human look.
+ *   20  unrecognised terminal page - a human should look at the capture.
+ *   21  CONFIRMED block - the portal said so in as many words. Same back-off
+ *        as 20, but the log can stop hedging about which one it was.
  *   30  a guard tripped  - transient, tolerate a few in a row
  *    1  crashed
  */
@@ -36,6 +38,11 @@ const EXIT = {
   SLOTS_FOUND: 10,
   UNKNOWN_REASON: 20,
   UNKNOWN_PAGE: 20,
+  // Separate from UNKNOWN_PAGE on purpose. Both back off identically, but one
+  // means "the detector has never seen this page" and the other means "the
+  // portal served us its rate-limit page". Sharing a code made the log report
+  // a known, expected, self-correcting rate limit as a mystery needing a human.
+  BLOCKED: 21,
   BUDGET_EXHAUSTED: 30,
   OSCILLATING: 30,
   NO_HANDLER: 30,

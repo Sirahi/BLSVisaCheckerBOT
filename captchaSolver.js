@@ -480,6 +480,24 @@ async function selectCaptchaBoxes(driver, targetNumber, kind = 'captcha') {
     }
   }
 
+  // A zero-tile selection cannot be right. The target number is always drawn
+  // from the nine tiles on screen, so the correct answer has at least one - and
+  // the portal answers an empty submission with an alert and then re-serves the
+  // SAME image. On 2026-08-27 that cost a whole cycle: eight identical
+  // submissions against target 119, eight alerts, and the preForm budget gone.
+  //
+  // Refusing to submit turns an unwinnable loop into a fact the caller can act
+  // on: this challenge is unreadable, go and get a different one.
+  if (clickedCount === 0) {
+    console.log(
+      `Captcha ${targetNumber}: 0/${boxesToScan.length} tiles - NOT submitting. ` +
+      `An empty answer is always rejected; asking for a fresh challenge instead.`
+    );
+    harvest.endChallenge({ submitted: false, clickedCount, scanned: boxesToScan.length });
+    if (isInIframe) await driver.switchTo().defaultContent();
+    return { clickedCount, submitted: false, alertText: null, unreadable: true };
+  }
+
   let submitted = false;
 
   const submitMethods = [
@@ -519,8 +537,38 @@ async function selectCaptchaBoxes(driver, targetNumber, kind = 'captcha') {
     scanned: boxesToScan.length,
   });
 
+  // driver.sleep is a client-side timer, so it is safe with an alert open.
   await driver.sleep(2000);
+
+  // Drain BEFORE switchTo(). An open alert makes the very next WebDriver
+  // command fail with "unexpected alert open", and switchTo() is a WebDriver
+  // command - so draining after it never ran. That is what filled the log of
+  // 2026-08-27 with
+  //   Captcha attempt failed: unexpected alert open: {Alert text : Please select correct number boxes}
+  // instead of the portal's actual message, and it also made the RATE_LIMITED
+  // branch below unreachable: the alert that would have identified a rate
+  // limit was being consumed by the failing command instead of read.
+  const alertText = await drainAlerts(driver);
   if (isInIframe) await driver.switchTo().defaultContent();
+
+  return { clickedCount, submitted: submitOk, alertText, unreadable: false };
+}
+
+// Accept every alert the portal has queued and return the LAST one's text
+// (null if there were none). Never throws: an alert that vanishes between the
+// wait and the read is not an error, it is the normal race.
+async function drainAlerts(driver) {
+  let text = null;
+  try {
+    for (;;) {
+      await driver.wait(until.alertIsPresent(), 800);
+      const alert = await driver.switchTo().alert();
+      text = await alert.getText();
+      await alert.accept();
+      await driver.sleep(300);
+    }
+  } catch (e) { /* no more alerts */ }
+  return text;
 }
 
 // ============================================
@@ -537,28 +585,29 @@ async function solveVisibleCaptcha(driver, { isLogin = false } = {}) {
   resetOCRStats();
   try {
     const target = await findTargetNumber(driver);
-    await selectCaptchaBoxes(driver, target, isLogin ? 'login' : 'entry');
+    const attempt = await selectCaptchaBoxes(driver, target, isLogin ? 'login' : 'entry');
+    const { clickedCount = 0, alertText = null, unreadable = false } = attempt || {};
+
+    // selectCaptchaBoxes has already drained the alerts by this point, so this
+    // command is safe. Doing it the other way round is the bug that made every
+    // portal alert surface as "unexpected alert open".
     await driver.switchTo().defaultContent();
 
-    // Accept any alert the portal raised, and report it - the caller decides.
-    let alertText = null;
-    try {
-      while (true) {
-        await driver.wait(until.alertIsPresent(), 800);
-        const alert = await driver.switchTo().alert();
-        alertText = await alert.getText();
-        await alert.accept();
-        await driver.sleep(300);
-      }
-    } catch (e) { /* no more alerts */ }
+    // Nothing was submitted, so there is nothing to be rejected - the challenge
+    // simply could not be read. Distinct from a refusal on purpose: the caller
+    // must fetch a DIFFERENT challenge rather than retry this one, which is
+    // guaranteed to fail exactly the same way.
+    if (unreadable) {
+      return { ok: false, target, clicked: 0, reason: 'NO_TILES_MATCHED' };
+    }
 
     if (alertText && /maximum number of captcha request|Please try after sometime/i.test(alertText)) {
-      return { ok: false, target, clicked: 0, reason: 'RATE_LIMITED' };
+      return { ok: false, target, clicked: clickedCount, reason: 'RATE_LIMITED' };
     }
     if (alertText) {
-      return { ok: false, target, clicked: 0, reason: `ALERT: ${alertText}` };
+      return { ok: false, target, clicked: clickedCount, reason: `ALERT: ${alertText}` };
     }
-    return { ok: true, target, clicked: 0, reason: null };
+    return { ok: true, target, clicked: clickedCount, reason: null };
   } catch (e) {
     try { await driver.switchTo().defaultContent(); } catch (e2) { /* ignore */ }
     return { ok: false, target: null, clicked: 0, reason: e.message };
@@ -566,6 +615,7 @@ async function solveVisibleCaptcha(driver, { isLogin = false } = {}) {
 }
 
 module.exports = {
+  drainAlerts, // exported for its unit test; the ordering is the risky part
   // exported so ../captcha-lab can benchmark the real pipeline offline
   preprocessAdaptive,
   otsuThreshold,

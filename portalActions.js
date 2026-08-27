@@ -168,7 +168,39 @@ async function selectKendoDropdownByLabel(
 // resolved at runtime. The button to click is always .btn-success
 // ("Ok" / "Accept"); .btn-danger is Reject and must never be clicked.
 // ============================================================
-async function dismissVisibleModal(driver, context = '') {
+//
+// WAITING, not sampling. The modal is raised by the portal's own change
+// handler and fades in over a few hundred milliseconds, so a single sweep
+// taken the instant a dropdown selection returns is a race - and on
+// 2026-08-27 that race was lost four times. Each loss looked like this:
+//
+//   [Visa Type] selected National Visa/ Long Term Visa      <- modal starts
+//   (no "Modal dismissed after Visa Type" line)             <- sweep too early
+//   [Visa Sub Type] could not select "National Visa"        <- modal in the way
+//   >>> list never rendered - dropdown did not open
+//
+// and cost a whole cycle. Every one of the seven cycles that got through that
+// day has the dismissal line; every one of the four that died lacks it.
+//
+// `waitMs` is opt-in because most fields raise no modal at all and paying the
+// full budget on each of them would add seconds to every form fill for
+// nothing. Zero (the default) keeps the old single-sweep behaviour for the
+// pre-flight checks, which want an answer about RIGHT NOW.
+async function dismissVisibleModal(driver, context = '', { waitMs = 0 } = {}) {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const hit = await sweepForVisibleModal(driver, context);
+    if (hit) return true;
+    if (Date.now() >= deadline) return false;
+    await driver.sleep(POLL_MS);
+  }
+}
+
+const POLL_MS = 150;
+
+// One pass over the DOM. Returns true if a visible modal was found AND
+// dismissed.
+async function sweepForVisibleModal(driver, context = '') {
   try {
     const modals = await driver.findElements(By.css('div.modal'));
     for (const modal of modals) {
@@ -642,7 +674,8 @@ function createPortalActions({ email, password, cfg, log }) {
     },
 
     fillFormAndSubmit: async (driver, item) => {
-      await dismissVisibleModal(driver, 'page load'); // #scamAlert fires here
+      const settle = (cfg.MODAL && cfg.MODAL.SETTLE_MS) || 0;
+      await dismissVisibleModal(driver, 'page load', { waitMs: settle }); // #scamAlert fires here
       const fields = [
         ['Location', item.location],
         ['Visa Type', cfg.FORM.VISA_TYPE],
@@ -653,9 +686,20 @@ function createPortalActions({ email, password, cfg, log }) {
         ['Category', item.category === 'Premium' ? cfg.FORM.CATEGORY_PREMIUM : cfg.FORM.CATEGORY_NORMAL],
       ];
       for (const [label, value] of fields) {
+        // Pre-flight. The post-field wait below catches the modal that the
+        // PREVIOUS field raised, but a slow one can still land in the gap. This
+        // costs one DOM sweep and is the difference between a lost cycle and a
+        // dismissed dialog, so it is paid before every dropdown rather than
+        // only before the one that happened to fail on 2026-08-27.
+        await dismissVisibleModal(driver, `${label} (pre-flight)`);
+
         const ok = await selectKendoDropdownByLabel(driver, label, value);
         if (!ok) throw new Error(`Form filling failed: ${label}`);
-        await dismissVisibleModal(driver, label);
+
+        // WAIT here. Visa Type raises "Information" and Category=Premium raises
+        // the premium confirmation; both fade in AFTER the selection returns,
+        // and an undismissed one covers every dropdown below it.
+        await dismissVisibleModal(driver, label, { waitMs: settle });
         await driver.sleep(cfg.SLEEP.SHORT);
       }
       const submit = await firstVisible(driver, '#btnSubmit');
