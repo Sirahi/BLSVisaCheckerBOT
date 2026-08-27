@@ -151,3 +151,61 @@ test('a missing Submit button still leaves the frame and still throws', async ()
   assert.ok(d.events.includes('default-content'),
     'the finally-block contract must survive the F1 change');
 });
+
+// ---- Dropdown option matching ------------------------------------------
+//
+// Matching used to be `=== || .includes()`, which made a config value a PREFIX
+// pattern rather than a name. That is ambiguous whenever one option's text
+// contains another's: Karachi lists both "National Visa" and "National Visas
+// (Study, Work & Other National Visas)", and a needle of "National Visa"
+// matches both. Which one got picked depended on DOM order.
+//
+// Matching is now equality, normalised for case and internal whitespace.
+
+const { optionMatches } = require('../portalActions');
+
+test('an exact option text matches', () => {
+  assert.strictEqual(optionMatches('Family Reunification Visa', 'Family Reunification Visa'), true);
+});
+
+test('matching ignores case and surrounding space', () => {
+  assert.strictEqual(optionMatches('  FAMILY reunification VISA ', 'Family Reunification Visa'), true);
+});
+
+// The portal renders "National Visa/ Long Term Visa" - space after the slash,
+// none before. Selenium's getText() collapses runs of whitespace, but the
+// config value is hand-typed, so internal spacing is normalised on both sides
+// rather than trusted to agree character for character.
+test('matching normalises internal whitespace', () => {
+  assert.strictEqual(optionMatches('National Visa/  Long  Term Visa', 'National Visa/ Long Term Visa'), true);
+});
+
+// The whole point of the change.
+test('a longer option is no longer matched by a shorter needle', () => {
+  assert.strictEqual(
+    optionMatches('National Visas (Study, Work & Other National Visas)', 'National Visa'),
+    false,
+  );
+});
+
+test('the two Karachi sub types are told apart', () => {
+  const opts = ['National Visa', 'National Visas (Study, Work & Other National Visas)'];
+  const hits = opts.filter((o) => optionMatches(o, 'National Visa'));
+  assert.deepStrictEqual(hits, ['National Visa'], 'exactly one option may match');
+});
+
+// Equality makes the config value a full name, so the old abbreviations no
+// longer resolve. Pinned so a half-finished revert is caught here rather than
+// live on the portal.
+test('an abbreviated config value no longer matches', () => {
+  assert.strictEqual(optionMatches('Family Reunification Visa', 'Family Reunification'), false);
+  assert.strictEqual(optionMatches('National Visa/ Long Term Visa', 'National Visa'), false);
+});
+
+test('the shipped config values match the option text the portal renders', () => {
+  const CFG = require('../config');
+  assert.strictEqual(optionMatches('National Visa/ Long Term Visa', CFG.FORM.VISA_TYPE), true);
+  assert.strictEqual(optionMatches('Family Reunification Visa', CFG.FORM.VISA_SUB_TYPE), true);
+  const karachi = CFG.CITIES.find((c) => c.name === 'Karachi');
+  if (karachi) assert.strictEqual(optionMatches('National Visa', karachi.VISA_SUB_TYPE), true);
+});

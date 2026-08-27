@@ -25,7 +25,11 @@ const LIMITS = { login: 3, preForm: 3, postForm: 3, unavailable: 5, profile: 3 }
 const tmp = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'cyc-')), 's.json');
 
 const CFG = {
-  CITIES: [{ name: 'Islamabad', LOCATION: 'Islamabad' }, { name: 'Lahore', LOCATION: 'Lahore' }],
+  // This whole file exercises the MULTI-CITY cycle - the profile subflow it
+  // asserts on only happens when a run crosses a city boundary. Set explicitly
+  // because it is no longer the default; see config.js MULTI_CITY.
+  MULTI_CITY: true,
+  ACTIVE_CITIES: [{ name: 'Islamabad', LOCATION: 'Islamabad' }, { name: 'Lahore', LOCATION: 'Lahore' }],
   MACHINE: { CATEGORIES: ['Normal', 'Premium'], MAX_TRANSITIONS: 60, OSCILLATION_LIMIT: 6 },
   MY_APPOINTMENTS_URL: 'https://example.test/Global/appointmentdata/MyAppointments',
   BASE_URL: 'https://example.test',

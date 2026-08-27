@@ -27,9 +27,17 @@ test('the degraded slots alert names the city it is sending a human to', async (
     'a list of every configured centre is not an instruction');
 });
 
+// Asserted against the RESOLVED active city, not the literal "Islamabad": the
+// fallback reads CFG.ACTIVE_CITIES, which ACTIVE_CITY in .env can change
+// without touching a line of code. Hardcoding the name made this fail the
+// moment the standing city moved to Karachi - a test of the config, not of the
+// fallback.
 test('with no city supplied it still falls back to the configured centres', async () => {
+  const expected = require('../config').ACTIVE_CITIES.map((c) => c.name);
   posts.length = 0;
   await notifySlotPageReached('something broke');
   assert.strictEqual(posts.length, 1);
-  assert.match(posts[0].text, /Islamabad/);
+  for (const name of expected) {
+    assert.match(posts[0].text, new RegExp(name), `the alert must name ${name}`);
+  }
 });

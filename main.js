@@ -1,11 +1,18 @@
 /**
  * The polling loop. Spawns one app.js run per cycle, then sleeps.
  *
+ * It runs round the clock - there are no working hours and no morning or
+ * afternoon cadence. The gap between cycles is drawn fresh from
+ * [SCHEDULER.INTERVAL_MIN_MINUTES, SCHEDULER.INTERVAL_MAX_MINUTES] every time,
+ * because a fixed cadence is the one thing a human checking a visa portal
+ * never has: nobody searches at 08:00, 08:20 and 08:40 on the dot.
+ *
  * Unlike the version this was adapted from, the loop READS the child's exit
  * code. Without that it cannot tell "no slots" from "blocked" from "the
  * browser died" and loops identically through all three - which for an
  * unattended day-long run means hammering through a block for hours and
- * leaving no record of when it started.
+ * leaving no record of when it started. A blocked cycle is the one case that
+ * does NOT draw at random: it backs off from the upper limit and climbs.
  *
  * Two env vars exist so the schedule itself can be tested without touching
  * the portal or editing constants:
@@ -20,7 +27,7 @@ const fs = require('fs');
 const path = require('path');
 
 const CFG = require('./config');
-const { createLogger, hourIn, partsIn } = require('./logger');
+const { createLogger, hourIn } = require('./logger');
 const { notifyBotError } = require('./telegramNotifier');
 
 const S = CFG.SCHEDULER;
@@ -36,51 +43,52 @@ const logger = createLogger({
   tee: false, // the scheduler logs deliberately; the child tees its own console
 });
 
-const T0 = Date.now();
 const scaled = TIME_SCALE_S > 0;
 
-// Under TIME_SCALE the whole clock is synthetic, including the night wait -
-// otherwise a scaled test would sleep for real hours at the day boundary.
+// Under TIME_SCALE the clock is synthetic so a scaled test can watch a day's
+// worth of intervals go by in a minute.
 const hourMs = scaled ? TIME_SCALE_S * 1000 : 60 * 60 * 1000;
-// Working hours are the PORTAL's hours, not the machine's - see
-// SCHEDULER.TIMEZONE. Reading getHours() here would have run the schedule on
-// London time, i.e. 12:00-04:00 in Pakistan.
-const currentHour = () =>
-  scaled ? Math.floor((Date.now() - T0) / hourMs) % 24 : hourIn(TZ);
 
-const isWorkingHours = () => {
-  const h = currentHour();
-  return h >= S.WORK_START_HOUR && h < S.WORK_END_HOUR;
-};
-const isMorning = () => {
-  const h = currentHour();
-  return h >= S.WORK_START_HOUR && h < S.MORNING_END_HOUR;
-};
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
-// Whole hours are not enough here. Counting only the hour number made 05:30
-// "3 hours short of hour 8", so the night sleep overshot by the 30 minutes
-// already spent inside the current hour and the morning burst began at 08:30 -
-// half an hour of the most valuable window gone. Wait to the TOP of the hour.
-function msUntilWorkStart(now = new Date()) {
-  if (scaled) {
-    // The scaled clock is a continuous ramp, so the fractional virtual hour is
-    // just elapsed time; there are no wall-clock parts to read.
-    const h = ((now.getTime() - T0) / hourMs) % 24;
-    const hoursToWait = h < S.WORK_START_HOUR
-      ? S.WORK_START_HOUR - h
-      : 24 - h + S.WORK_START_HOUR;
-    return hoursToWait * hourMs;
-  }
-  const t = partsIn(TZ, now);
-  const hoursToWait = t.h < S.WORK_START_HOUR
-    ? S.WORK_START_HOUR - t.h
-    : 24 - t.h + S.WORK_START_HOUR;
-  const msIntoHour = t.mi * 60000 + t.s * 1000 + now.getMilliseconds();
-  return hoursToWait * hourMs - msIntoHour;
+// How long to wait after an ordinary cycle. Uniform over the configured
+// limits, at SECONDS resolution - whole-minute gaps are still a pattern, and
+// the entire point of drawing at all is to stop looking like a cron job.
+//
+// `rand` is a parameter so the tests can pin the endpoints without stubbing
+// Math.random globally.
+function nextIntervalMinutes(rand = Math.random) {
+  const { INTERVAL_MIN_MINUTES: lo, INTERVAL_MAX_MINUTES: hi } = S;
+  return Math.round((lo + rand() * (hi - lo)) * 60) / 60;
 }
 
-const fmt = (ms) => `${Math.floor(ms / 3600000)}h ${Math.floor((ms % 3600000) / 60000)}m`;
-const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+// Minutes -> ms, honouring TIME_SCALE so a scaled run does not sleep for real.
+const intervalToMs = (min) => (scaled ? (min / 60) * hourMs : min * 60 * 1000);
+
+// 26.6667 -> "26m 40s". Whole minutes still read as "20m", so the label does
+// not get noisier for the cases where the draw happens to land round.
+function fmtMinutes(min) {
+  const totalS = Math.round(min * 60);
+  const m = Math.floor(totalS / 60);
+  const s = totalS % 60;
+  return s === 0 ? `${m}m` : `${m}m ${s}s`;
+}
+
+// One ledger row. `waitMin` replaces the old `mode` field: morning/afternoon
+// stopped meaning anything when the loop went round the clock, and the gap the
+// loop actually chose is the number you need to answer "how many searches in
+// the last N hours". null means the loop stopped instead of waiting.
+function ledgerEntry({ cycle, code, result, durationMs, waitMin }) {
+  return {
+    ts: new Date().toISOString(),
+    cycle,
+    exit: code,
+    result,
+    searches: readSearchTotal(),
+    durationMs,
+    waitMin: waitMin === null ? null : Number(waitMin.toFixed(2)),
+  };
+}
 
 function recordCycle(entry) {
   try {
@@ -146,32 +154,23 @@ function classify(code) {
 
 // Streak bookkeeping, pure so the reset rule is testable without spawning a
 // child. A cycle that gets through clears BOTH streaks - two blocks then a
-// successful run means the run after it is paced by the ordinary
-// morning/afternoon interval again, not by a multiplier still carrying blocks
-// that are over.
+// successful run means the run after it is paced by an ordinary random draw
+// again, not by a multiplier still carrying blocks that are over.
 function nextStreaks(prev, { blocked, failure }) {
   if (blocked) return { failures: prev.failures, blocks: prev.blocks + 1 };
   if (failure) return { failures: prev.failures + 1, blocks: prev.blocks };
   return { failures: 0, blocks: 0 };
 }
 
-// A block is the portal rate-limiting the day's activity, and a night off is
-// exactly the remedy - so the block streak does NOT survive the night sleep.
-// Carrying it over meant an evening spent blocked resumed the next morning
-// mid-backoff, spending the most valuable window of the day on 120m waits
-// instead of a fresh 20m burst. The failure streak is untouched: a crash streak
-// is a broken setup, and sleeping does not fix chromedriver.
-function afterNightSleep(streaks) {
-  return { failures: streaks.failures, blocks: 0 };
-}
-
-// How long to wait after the nth consecutive block. n === 1 is the ordinary
-// interval for the time of day; each further unbroken block multiplies it, up
-// to the ceiling.
+// How long to wait after the nth consecutive block. The caller always passes
+// INTERVAL_MAX_MINUTES as the base: n === 1 is therefore the slowest ORDINARY
+// pace, and each further unbroken block multiplies it, up to the ceiling.
 function blockWaitMinutes(baseMin, consecutiveBlocks) {
   const steps = Math.max(0, consecutiveBlocks - 1);
   const grown = baseMin * Math.pow(S.BLOCK_BACKOFF_MULTIPLIER, steps);
-  return Math.min(grown, S.BLOCK_BACKOFF_MAX_MIN);
+  // Strictly greater. A wait that lands exactly on the ceiling is legal and
+  // passes through untouched.
+  return grown > S.BLOCK_BACKOFF_MAX_MIN ? S.BLOCK_BACKOFF_MAX_MIN : grown;
 }
 
 async function loop() {
@@ -185,10 +184,8 @@ async function loop() {
     logger.warning('Sched', 'Unset it (and remove it from .env) before any real run.');
     logger.warning('Sched', '*'.repeat(64));
   }
-  // hourIn, not currentHour - the banner must state the REAL portal hour even
-  // when TIME_SCALE has replaced the clock underneath the loop.
   logger.display('Sched', `Timezone ${TZ || 'machine-local'} - it is hour ${hourIn(TZ)} there now (machine is hour ${new Date().getHours()}).`);
-  logger.display('Sched', `Hours ${S.WORK_START_HOUR}-${S.WORK_END_HOUR}; morning until ${S.MORNING_END_HOUR} every ${S.MORNING_INTERVAL_MIN}m, then every ${S.AFTERNOON_INTERVAL_MIN}m.`);
+  logger.display('Sched', `Running round the clock; each gap drawn at random from ${S.INTERVAL_MIN_MINUTES}-${S.INTERVAL_MAX_MINUTES}m.`);
   if (scaled) logger.warning('Sched', `TIME_SCALE=${TIME_SCALE_S} - 1 virtual hour = ${TIME_SCALE_S}s. NOT a real schedule.`);
   logger.display('Sched', `Logging to ${logger.file}`);
 
@@ -196,51 +193,39 @@ async function loop() {
   let streaks = { failures: 0, blocks: 0 };
 
   while (true) {
-    if (!isWorkingHours()) {
-      const wait = msUntilWorkStart();
-      const label = scaled
-        ? `${(wait / hourMs).toFixed(1)} virtual hours (${Math.round(wait / 1000)}s real)`
-        : fmt(wait);
-      logger.display('Sched', `Outside working hours - sleeping ${label} until hour ${S.WORK_START_HOUR}.`);
-      await sleep(wait);
-      if (streaks.blocks > 0) {
-        logger.display('Sched', `New day - clearing a block streak of ${streaks.blocks}; the morning starts at the ordinary ${S.MORNING_INTERVAL_MIN}m interval.`);
-      }
-      streaks = afterNightSleep(streaks);
-      continue;
-    }
-
     cycle += 1;
-    const morning = isMorning();
     const startedAt = Date.now();
-    logger.display('Sched', `Cycle ${cycle} starting (${morning ? 'morning' : 'afternoon'}, virtual hour ${currentHour()}).`);
+    logger.display('Sched', `Cycle ${cycle} starting (hour ${hourIn(TZ)} in ${TZ || 'machine-local'}).`);
 
     const code = await runOnce();
     const verdict = classify(code);
     const { result, halt, blocked } = verdict;
     const durationMs = Date.now() - startedAt;
 
-    recordCycle({
-      ts: new Date().toISOString(),
-      cycle,
-      exit: code,
-      result,
-      searches: readSearchTotal(),
-      durationMs,
-      mode: morning ? 'morning' : 'afternoon',
-    });
-
     logger.display('Sched', `Cycle ${cycle} finished: ${result} (exit ${code}) in ${Math.round(durationMs / 1000)}s.`);
 
     // SLOTS_FOUND is now the only outcome that stops the loop on its own.
     if (halt) {
       // app.js already fired the repeating alerts and is holding the browser.
+      recordCycle(ledgerEntry({ cycle, code, result, durationMs, waitMin: null }));
       logger.display('Sched', 'SLOTS FOUND - stopping the loop. The browser is being held open by the run.');
       return;
     }
 
     const recovered = streaks.blocks > 0 && !blocked;
     streaks = nextStreaks(streaks, verdict);
+
+    // Decided before the stop checks so the ledger can record what the loop
+    // WOULD have waited even on a cycle that turns out to be the last.
+    //
+    // A blocked cycle does not draw. The randomness is there to look human
+    // while polling, and a blocked bot is not polling - so a block goes
+    // straight to the slowest ordinary pace and climbs from there.
+    const waitMin = blocked
+      ? blockWaitMinutes(S.INTERVAL_MAX_MINUTES, streaks.blocks)
+      : nextIntervalMinutes();
+
+    recordCycle(ledgerEntry({ cycle, code, result, durationMs, waitMin }));
 
     if (blocked) {
       logger.error('Sched', `Unrecognised terminal page - the likely block (${streaks.blocks}/${S.MAX_CONSECUTIVE_BLOCKS} consecutive). The capture is written; retrying rather than stopping.`);
@@ -255,7 +240,7 @@ async function loop() {
       // STOPPING, and a slot (which app.js announces itself, repeatedly). A
       // message per block trains you to ignore the one that matters.
     } else if (recovered) {
-      logger.display('Sched', 'Back in after the block - streak cleared, back to the ordinary interval.');
+      logger.display('Sched', 'Back in after the block - streak cleared, back to the ordinary random interval.');
     }
 
     if (streaks.failures > 0) {
@@ -267,12 +252,17 @@ async function loop() {
       }
     }
 
-    const baseInterval = morning ? S.MORNING_INTERVAL_MIN : S.AFTERNOON_INTERVAL_MIN;
-    const interval = blocked ? blockWaitMinutes(baseInterval, streaks.blocks) : baseInterval;
-    const waitMs = scaled ? (interval / 60) * hourMs : interval * 60 * 1000;
-    const label = scaled ? Math.round(waitMs / 1000) + 's (scaled)' : Math.round(interval) + 'm';
-    const backedOff = blocked && interval !== baseInterval ? ` (backed off from ${baseInterval}m)` : '';
-    logger.display('Sched', `Next check in ${label}${backedOff}.`);
+    const waitMs = intervalToMs(waitMin);
+    const label = scaled ? `${Math.round(waitMs / 1000)}s (scaled)` : fmtMinutes(waitMin);
+    // The first block is not "backed off" from anything - it IS the upper
+    // limit. Saying otherwise makes the log read as though a multiplier had
+    // already been applied.
+    const why = blocked
+      ? ` (blocked ${streaks.blocks}x - ${waitMin > S.INTERVAL_MAX_MINUTES
+          ? `backed off from ${S.INTERVAL_MAX_MINUTES}m`
+          : `the ${S.INTERVAL_MAX_MINUTES}m upper limit`})`
+      : ` (random draw from ${S.INTERVAL_MIN_MINUTES}-${S.INTERVAL_MAX_MINUTES}m)`;
+    logger.display('Sched', `Next check in ${label}${why}.`);
     await sleep(waitMs);
   }
 }
@@ -280,4 +270,4 @@ async function loop() {
 // Guarded like app.js: requiring this file must not start polling the portal.
 if (require.main === module) loop();
 
-module.exports = { classify, loop, msUntilWorkStart, nextStreaks, blockWaitMinutes, afterNightSleep };
+module.exports = { classify, loop, nextStreaks, blockWaitMinutes, nextIntervalMinutes };

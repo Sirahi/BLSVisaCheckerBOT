@@ -17,13 +17,27 @@ const { solveVisibleCaptcha } = require('./captchaSolver');
 const { capturePage } = require('./capture');
 
 // Dropdown selection function - matches by LABEL TEXT
+// Does a rendered option text name the option the config asked for?
+//
+// EQUALITY, not containment. The old test was `=== || .includes()`, which made
+// a config value a prefix pattern instead of a name: Karachi lists both
+// "National Visa" and "National Visas (Study, Work & Other National Visas)",
+// so a needle of "National Visa" matched both and the winner was whichever
+// came first in DOM order.
+//
+// Normalised on both sides before comparing. Selenium's getText() collapses
+// runs of whitespace, the config value is hand-typed, and the portal's own
+// "National Visa/ Long Term Visa" has a space on one side of the slash only -
+// so case and internal spacing are not worth failing over. Everything else is.
+const normalise = (s) => String(s).trim().toLowerCase().replace(/\s+/g, ' ');
+const optionMatches = (optionText, wanted) => normalise(optionText) === normalise(wanted);
+
 async function selectKendoDropdownByLabel(
   driver,
   labelText,
   visibleText,
   timeout = CFG.DROPDOWN.TIMEOUT
 ) {
-  const targetText = visibleText.trim().toLowerCase();
 
   try {
     // Find all label elements
@@ -95,7 +109,7 @@ async function selectKendoDropdownByLabel(
               try {
                 const txt = (await item.getText()).trim();
                 if (txt) seenOptions.add(txt);
-                if (txt && (txt.toLowerCase() === targetText || txt.toLowerCase().includes(targetText))) {
+                if (txt && optionMatches(txt, visibleText)) {
                   await driver.executeScript("arguments[0].scrollIntoView({block: 'center'});", item);
                   await driver.sleep(150);
                   await driver.executeScript("arguments[0].click();", item);
@@ -632,7 +646,10 @@ function createPortalActions({ email, password, cfg, log }) {
       const fields = [
         ['Location', item.location],
         ['Visa Type', cfg.FORM.VISA_TYPE],
-        ['Visa Sub Type', cfg.FORM.VISA_SUB_TYPE],
+        // From the ITEM, not cfg: the sub type is per city (buildPlan resolves
+        // the override against the global FORM value). Falls back for any
+        // caller that still hands over a plan item built before this existed.
+        ['Visa Sub Type', item.visaSubType || cfg.FORM.VISA_SUB_TYPE],
         ['Category', item.category === 'Premium' ? cfg.FORM.CATEGORY_PREMIUM : cfg.FORM.CATEGORY_NORMAL],
       ];
       for (const [label, value] of fields) {
@@ -723,6 +740,7 @@ function createPortalActions({ email, password, cfg, log }) {
 module.exports = {
   createPortalActions,
   selectKendoDropdownByLabel,
+  optionMatches, // exported for its unit test; the match rule is the risky part
   dismissVisibleModal,
   scanAndNotifySlots,
   fakeSlotDates,
