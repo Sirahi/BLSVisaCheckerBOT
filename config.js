@@ -287,6 +287,24 @@ module.exports = {
         TIMEOUT: 10000, // ms
     },
 
+    // === MODALS ===
+    MODAL: {
+        // How long to WAIT for a modal the portal is about to raise, after the
+        // dropdown selection that triggers it. Selecting Visa Type = National
+        // opens an "Information" dialog and Category = Premium opens a
+        // confirmation; both fade in a few hundred ms after the selection
+        // returns, and an undismissed one covers the dropdowns below it.
+        //
+        // Sampling the DOM once instead of waiting cost four whole cycles on
+        // 2026-08-27 - each died on "Visa Sub Type: list never rendered" with
+        // the Information modal still sitting on top of it.
+        //
+        // Paid only after a field is set, and abandoned the moment a modal is
+        // found, so the common no-modal case costs this once per field and the
+        // triggering case costs almost nothing.
+        SETTLE_MS: 1500,
+    },
+
     // === CAPTCHA ===
     CAPTCHA: {
         EARLY_EXIT_VOTES: 3,
