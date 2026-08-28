@@ -283,3 +283,124 @@ test('with no wait budget it still sweeps exactly once and returns', async () =>
   assert.strictEqual(ok, false);
   assert.strictEqual(d.state.polls, 1, 'a no-wait call must not poll in a loop');
 });
+
+// ===========================================================================
+// The result shot must fire from fillFormAndSubmit, AFTER the submit click.
+//
+// Its whole purpose is to be evidence about what a search returned, in a case
+// where the detector's own verdict is what is in question - "is a
+// slots-available page being read as no-slots?". So two properties matter and
+// are asserted here rather than left to inspection:
+//
+//   1. it happens after the click, so it photographs the RESULT, not the form
+//   2. it is not conditional on the detected state - nothing downstream can
+//      suppress it, because a misread page is exactly the one worth having
+//
+// and a third, which is about not making things worse: a real search has just
+// been spent against a budget the portal blocks you for exceeding, so a
+// screenshot that fails must never fail the cycle.
+const fsx = require('fs');
+const osx = require('os');
+const pathx = require('path');
+
+// A fake portal form: four labelled Kendo dropdowns that really do open and
+// really do offer the option asked for, plus a #btnSubmit. Built to satisfy
+// the REAL selectKendoDropdownByLabel rather than stubbing it out, so the test
+// exercises the same submit tail production does.
+function formDriver(order, { screenshot } = {}) {
+  const dropdown = { tag: 'k-dropdown-wrap' };
+
+  const option = (text) => ({
+    getText: async () => text,
+    isDisplayed: async () => true,
+  });
+
+  // Whatever the currently-open dropdown is, it offers every value the form
+  // asks for - which value gets picked is not what this test is about.
+  const list = {
+    isDisplayed: async () => true,
+    findElements: async () => ['Karachi', 'vt', 'vst', 'Normal', 'Premium'].map(option),
+  };
+
+  const labelEl = (text) => ({
+    getText: async () => text,
+    findElement: async () => ({
+      isDisplayed: async () => true,
+      findElement: async () => dropdown,
+    }),
+  });
+
+  const submitBtn = {
+    isDisplayed: async () => true,
+    isEnabled: async () => true,
+    click: async () => { order.push('SUBMIT-CLICK'); },
+  };
+
+  return {
+    sleep: async () => {},
+    executeScript: async () => {},
+    wait: async (x) => x,
+    findElement: async () => submitBtn,
+    findElements: async (by) => {
+      const sel = String(by.value || '');
+      if (sel.includes('label.form-label')) {
+        return ['Location', 'Visa Type', 'Visa Sub Type', 'Category'].map(labelEl);
+      }
+      if (sel.includes('k-list-container') || sel.includes('k-animation-container')) return [list];
+      if (sel.includes('#btnSubmit')) return [submitBtn];
+      if (sel.includes('div.modal')) return [];          // no modals on this form
+      return [];
+    },
+    takeScreenshot: async () => {
+      order.push('SCREENSHOT');
+      if (screenshot === 'fail') throw new Error('session deleted');
+      return Buffer.from('x').toString('base64');
+    },
+  };
+}
+
+const SHOT_CFG = (dir) => ({
+  SLEEP: { SHORT: 0, MEDIUM: 0, LONG: 0, AFTER_SUBMIT: 0 },
+  DROPDOWN: { TIMEOUT: 200 },
+  MODAL: { SETTLE_MS: 0 },
+  FORM: { VISA_TYPE: 'vt', VISA_SUB_TYPE: 'vst', CATEGORY_NORMAL: 'Normal', CATEGORY_PREMIUM: 'Premium' },
+  SHOTS: { ENABLED: true, DIR: dir, KEEP: 200 },
+});
+
+const KHI_PREMIUM = { city: 'Karachi', location: 'Karachi', category: 'Premium', label: 'Karachi/Premium', visaSubType: 'vst' };
+const KHI_NORMAL  = { city: 'Karachi', location: 'Karachi', category: 'Normal',  label: 'Karachi/Normal',  visaSubType: 'vst' };
+
+test('the result shot is taken after the submit click, not before', async () => {
+  const dir = fsx.mkdtempSync(pathx.join(osx.tmpdir(), 'pa-shots-'));
+  const order = [];
+  const cfg = SHOT_CFG(dir);
+  const acts = createPortalActions({ email: 'e', password: 'p', cfg, log: () => {} });
+  await acts.fillFormAndSubmit(formDriver(order), KHI_PREMIUM);
+
+  assert.ok(order.includes('SCREENSHOT'), 'a result shot must be taken');
+  assert.ok(order.indexOf('SUBMIT-CLICK') < order.indexOf('SCREENSHOT'),
+    'the shot must come AFTER the click, or it photographs the form, not the result');
+  const files = fsx.readdirSync(dir).filter((f) => f.endsWith('.png'));
+  assert.strictEqual(files.length, 1);
+  assert.match(files[0], /Karachi-Premium/, 'the shot must say which search it belongs to');
+});
+
+test('a screenshot failure never fails a search that already cost budget', async () => {
+  const dir = fsx.mkdtempSync(pathx.join(osx.tmpdir(), 'pa-shots-'));
+  const order = [];
+  const cfg = SHOT_CFG(dir);
+  const acts = createPortalActions({ email: 'e', password: 'p', cfg, log: () => {} });
+  await acts.fillFormAndSubmit(formDriver(order, { screenshot: 'fail' }), KHI_NORMAL);
+  assert.ok(order.includes('SUBMIT-CLICK'), 'the search still completed');
+});
+
+test('shots can be switched off without touching code', async () => {
+  const dir = fsx.mkdtempSync(pathx.join(osx.tmpdir(), 'pa-shots-'));
+  const order = [];
+  const cfg = SHOT_CFG(dir);
+  cfg.SHOTS.ENABLED = false;
+  const acts = createPortalActions({ email: 'e', password: 'p', cfg, log: () => {} });
+  await acts.fillFormAndSubmit(formDriver(order), KHI_NORMAL);
+  assert.ok(order.includes('SUBMIT-CLICK'), 'the search still happens');
+  assert.ok(!order.includes('SCREENSHOT'), 'no screenshot when disabled');
+});

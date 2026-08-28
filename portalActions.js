@@ -15,6 +15,8 @@ const MSG = require('./messages');
 const { startSlotAlerts, notifySlotPageReached } = require('./telegramNotifier');
 const { solveVisibleCaptcha } = require('./captchaSolver');
 const { capturePage } = require('./capture');
+const { saveResultShot } = require('./shots');
+const path = require('path');
 
 // Dropdown selection function - matches by LABEL TEXT
 // Does a rendered option text name the option the config asked for?
@@ -707,6 +709,28 @@ function createPortalActions({ email, password, cfg, log }) {
       await driver.wait(until.elementIsEnabled(submit), 5000);
       await clickIt(driver, submit);
       await driver.sleep(cfg.SLEEP.AFTER_SUBMIT);
+
+      // Photograph whatever came back, before anything classifies it.
+      //
+      // The log already records the detector's verdict for this page, but a
+      // verdict is not evidence when the open question is whether the detector
+      // is right - specifically whether a slots-available page is being read as
+      // "no slots". Taken HERE rather than from the DEAD_END handler on
+      // purpose: a shot keyed on the detected state would be gated by the very
+      // classification it exists to check, so the one page worth having a
+      // picture of - a misread one - is the one that would never be shot.
+      //
+      // Never allowed to throw: a real search has just been spent, against a
+      // budget the portal blocks you for exceeding.
+      const shotCfg = cfg.SHOTS || {};
+      const shot = await saveResultShot(driver, {
+        label: item.label,
+        dir: shotCfg.DIR,
+        keep: shotCfg.KEEP,
+        enabled: shotCfg.ENABLED !== false,
+        log: (m) => console.log(m),
+      });
+      if (shot) console.log(`\u{1F4F7} Result page: ${path.basename(shot)}`);
     },
 
     // Signature stays exactly as moved - it reads CFG and MSG from module scope.

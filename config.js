@@ -324,6 +324,18 @@ module.exports = {
         SLOT_ALERT_INTERVAL_MS: 5000,
     },
 
+    // === RESULT SCREENSHOTS ===
+    SHOTS: {
+        ENABLED: true,
+        DIR: require('path').join(__dirname, 'logs', 'shots'),
+        // ~30 cycles a day x 2 searches = ~60 shots daily, forever. A real
+        // portal page measures ~33KB as a PNG, so 200 is about three days of
+        // history for well under 10MB - and it is a HARD cap: the oldest are
+        // deleted on every write, so a 24-hour run and a 24-day one cost the
+        // same disk.
+        KEEP: 200,
+    },
+
     // === LOGGING ===
     LOG: {
         DIR: require('path').join(__dirname, 'logs'),
