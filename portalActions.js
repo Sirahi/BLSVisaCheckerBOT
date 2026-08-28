@@ -16,6 +16,7 @@ const { startSlotAlerts, notifySlotPageReached } = require('./telegramNotifier')
 const { solveVisibleCaptcha } = require('./captchaSolver');
 const { capturePage } = require('./capture');
 const { saveResultShot } = require('./shots');
+const { waitForPageSettled } = require('./settle');
 const path = require('path');
 
 // Dropdown selection function - matches by LABEL TEXT
@@ -597,6 +598,12 @@ async function openApplicantEditImpl(driver, cfg) {
         }
         await clickIt(driver, el);
         await driver.sleep(cfg.SLEEP.LONG);
+        await waitForPageSettled(driver, {
+          timeout: (cfg.SETTLE && cfg.SETTLE.TIMEOUT_MS) || 15000,
+          quietMs: (cfg.SETTLE && cfg.SETTLE.QUIET_MS) || 600,
+          pollMs: (cfg.SETTLE && cfg.SETTLE.POLL_MS) || 150,
+          log: (m) => console.log(`⏳ applicant edit: ${m}`),
+        });
         return;
       } catch (e) { /* stale - try the next */ }
     }
@@ -605,6 +612,17 @@ async function openApplicantEditImpl(driver, cfg) {
 }
 
 function createPortalActions({ email, password, cfg, log }) {
+  // Wait for the portal to stop loading. Used after EVERY navigation: each one
+  // is followed by detect(), and detect on a half-loaded page matches no
+  // predicate - which is reported as UNKNOWN and answered by the scheduler with
+  // a 40-60 minute back-off. A slow page must not be able to look like a ban.
+  const settled = (driver, where) => waitForPageSettled(driver, {
+    timeout: (cfg.SETTLE && cfg.SETTLE.TIMEOUT_MS) || 15000,
+    quietMs: (cfg.SETTLE && cfg.SETTLE.QUIET_MS) || 600,
+    pollMs: (cfg.SETTLE && cfg.SETTLE.POLL_MS) || 150,
+    log: (m) => console.log(`⏳ ${where}: ${m}`),
+  });
+
   return {
     solve: (driver, opts) => solveVisibleCaptcha(driver, opts),
 
@@ -617,6 +635,7 @@ function createPortalActions({ email, password, cfg, log }) {
       if (!btn) throw new Error('Dead-end button not found');
       await clickIt(driver, btn);
       await driver.sleep(cfg.SLEEP.AFTER_LOGIN);
+      await settled(driver, 'dead-end button');
     },
 
     clickBookNow: async (driver) => {
@@ -628,6 +647,7 @@ function createPortalActions({ email, password, cfg, log }) {
           if (!(await el.isDisplayed())) continue;
           await clickIt(driver, el);
           await driver.sleep(cfg.SLEEP.AFTER_LOGIN);
+          await settled(driver, 'Book Now');
           return;
         } catch (e) { /* try the next one */ }
       }
@@ -640,11 +660,13 @@ function createPortalActions({ email, password, cfg, log }) {
     goToMyAppointments: async (driver) => {
       await driver.get(cfg.MY_APPOINTMENTS_URL);
       await driver.sleep(cfg.SLEEP.AFTER_LOGIN);
+      await settled(driver, 'MyAppointments');
     },
 
     goHome: async (driver) => {
       await driver.get(cfg.BASE_URL + cfg.BLS_HOME_URL);
       await driver.sleep(cfg.SLEEP.AFTER_LOGIN);
+      await settled(driver, 'home');
     },
 
     fillEmail: async (driver) => {
@@ -656,6 +678,7 @@ function createPortalActions({ email, password, cfg, log }) {
       if (!verify) throw new Error('Verify button not found');
       await clickIt(driver, verify);
       await driver.sleep(cfg.SLEEP.AFTER_LOGIN);
+      await settled(driver, 'email verify');
     },
 
     fillPasswordAndSolve: async (driver) => {
@@ -709,6 +732,10 @@ function createPortalActions({ email, password, cfg, log }) {
       await driver.wait(until.elementIsEnabled(submit), 5000);
       await clickIt(driver, submit);
       await driver.sleep(cfg.SLEEP.AFTER_SUBMIT);
+
+      // The one that prompted all of this. The shot below and the detect() that
+      // follows this function both need a page that has finished rendering.
+      await settled(driver, 'search result');
 
       // Photograph whatever came back, before anything classifies it.
       //
@@ -772,6 +799,7 @@ function createPortalActions({ email, password, cfg, log }) {
       await clickIt(driver, proceed);
       console.log(MSG.PROFILE_PROCEED_CLICKED);
       await driver.sleep(cfg.SLEEP.LONG);
+      await settled(driver, 'profile Proceed');
     },
 
     submitProfileFrame: async (driver) => {
@@ -788,6 +816,15 @@ function createPortalActions({ email, password, cfg, log }) {
         await clickIt(driver, btn);
         console.log(MSG.PROFILE_SUBMIT_CLICKED);
         await driver.sleep(cfg.SLEEP.MEDIUM);
+        // NO settle wait here, deliberately. This click is inside the Kendo
+        // iframe and the portal answers it with a JS ALERT, which is accepted
+        // by acceptProfileAlert below. waitForPageSettled runs a script, and a
+        // script issued while an alert is open fails with "unexpected alert
+        // open" - the exact bug fixed in the captcha path on 2026-08-27.
+        // Settling here would reintroduce it one function over.
+        //
+        // Nothing is lost: the caller follows this with goHome(), which settles
+        // on the way out, and that is the page detect() actually looks at.
       } finally {
         // Runs even when Submit was never found, so a failure can never strand
         // the driver inside the iframe for the next detect(). If the try block

@@ -324,6 +324,27 @@ module.exports = {
         SLOT_ALERT_INTERVAL_MS: 5000,
     },
 
+    // === PAGE SETTLING ===
+    //
+    // Every navigation waits for the portal to STOP LOADING, rather than
+    // sleeping a fixed guess and hoping. The old fixed sleeps were a bet on the
+    // portal's response time that was visibly lost on 2026-08-28: one result
+    // screenshot came back as a loading spinner while another in the same cycle
+    // came back as a real page.
+    //
+    // The screenshot was the harmless victim. detect() is the dangerous one - a
+    // spinner page matches no predicate, so it reports UNKNOWN, which the
+    // scheduler reads as a BLOCK and answers with a 40-60 minute back-off.
+    SETTLE: {
+        // Ceiling, not a target. A settled page returns after QUIET_MS.
+        TIMEOUT_MS: 15000,
+        // How long the page must stay calm before it counts as settled. The
+        // overlay does not appear the instant a click returns, so accepting the
+        // first calm sample would read the gap BEFORE the spinner as "done".
+        QUIET_MS: 600,
+        POLL_MS: 150,
+    },
+
     // === RESULT SCREENSHOTS ===
     SHOTS: {
         ENABLED: true,

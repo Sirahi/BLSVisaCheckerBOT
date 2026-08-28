@@ -26,7 +26,10 @@ function fakeDriver({ xpath = [], css = [] } = {}) {
   };
 }
 
-const cfg = { SLEEP: { LONG: 0 } };
+// SETTLE is tiny here: these fakes have no DOM, so the settle probe can never
+// report calm and will always run to its timeout. That is correct behaviour
+// (it proceeds anyway) - it just must not cost the suite 15 real seconds.
+const cfg = { SLEEP: { LONG: 0 }, SETTLE: { TIMEOUT_MS: 10, QUIET_MS: 5, POLL_MS: 5 } };
 
 test('the fallback never clicks an anchor that reads like Add New Member', async () => {
   const clicked = [];
